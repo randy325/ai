@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-bot"
+version = "0.1.0"
+description = "A backtesting and paper-trading bot built on the Python standard library"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Intended Audience :: Developers",
+]
+dependencies = []
+
+[project.scripts]
+trading-bot = "trading_bot.cli:main"
+
+[tool.setuptools]
+packages = ["trading_bot"]
