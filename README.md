@@ -17,18 +17,24 @@ python -m trading_bot backtest --strategy breakout
 ```
 
 That runs on a reproducible synthetic price series, so it works before you have
-any data. To use your own:
+any data. To run on real market prices, name a provider — no API key needed:
 
 ```bash
-python -m trading_bot backtest --strategy sma-crossover --data prices.csv --symbol AAPL
+python -m trading_bot backtest --provider yahoo --symbol AAPL --strategy breakout
+python -m trading_bot backtest --provider binance --symbol BTCUSDT --interval 4h
 ```
 
-Any CSV with a date column and a close column works. Column names are matched
-case-insensitively, and `open`/`high`/`low`/`volume` are optional:
+Or use your own CSV. Any file with a date column and a close column works;
+column names are matched case-insensitively, and `open`/`high`/`low`/`volume`
+are optional:
 
 ```csv
 timestamp,open,high,low,close,volume
 2020-01-02,74.06,75.15,73.80,75.09,135480400
+```
+
+```bash
+python -m trading_bot backtest --strategy sma-crossover --data prices.csv --symbol AAPL
 ```
 
 ## Commands
@@ -38,16 +44,69 @@ timestamp,open,high,low,close,volume
 | `backtest` | Run one strategy over one series and print a performance report |
 | `compare` | Run every strategy over the same series, ranked by Sharpe ratio |
 | `optimize` | Grid-search a strategy's parameters |
+| `fetch` | Download real market bars to a CSV file |
+| `paper` | Paper-trade live bars as they close |
+| `providers` | List the live data providers |
 | `demo-data` | Write a synthetic OHLCV file you can experiment with |
 | `strategies` | List the available strategies |
 
 ```bash
-python -m trading_bot compare --bars 1000
+python -m trading_bot compare --provider yahoo --symbol MSFT
 python -m trading_bot optimize --strategy sma-crossover --grid fast=5,10,20 --grid slow=50,100,200
 python -m trading_bot backtest --strategy breakout --export-trades trades.csv
 ```
 
 Run `python -m trading_bot <command> --help` for the full flag list.
+
+## Live market data
+
+Four providers, none of which needs an API key:
+
+| Provider | Covers | Intervals | Symbol format |
+| --- | --- | --- | --- |
+| `stooq` | stocks, ETFs, indices | `1d` `1w` | `aapl.us`, `^spx` (a bare `AAPL` gets `.us`) |
+| `yahoo` | stocks, ETFs | `1m` … `1w` | `AAPL` |
+| `binance` | crypto | `1m` … `1w` | `BTCUSDT` |
+| `coinbase` | crypto | `1m` … `1d` | `BTC-USD` |
+
+```bash
+python -m trading_bot providers
+python -m trading_bot fetch --provider stooq --symbol AAPL --limit 2000 --out data/aapl.csv
+python -m trading_bot backtest --provider coinbase --symbol ETH-USD --interval 1h
+```
+
+Responses are cached under `.cache/market-data` for 12 hours. That matters more
+than it sounds: `optimize` re-runs the same feed dozens of times, and a free
+provider will throttle you long before a grid search finishes. Use
+`--cache-hours` to change the window, or `--no-cache` to always refetch.
+
+Providers have real limits. Yahoo caps intraday history at roughly 7 days at
+`1m` and 60 days otherwise; Binance returns at most 1000 bars per request and
+Coinbase 300; Stooq is daily-and-slower only, and rate-limits by IP. Ask for
+more bars than a provider will give and you get what it has, not an error.
+
+### Live paper trading
+
+```bash
+python -m trading_bot paper --provider binance --symbol BTCUSDT --interval 1m \
+    --strategy breakout --warmup 200
+```
+
+This polls for new bars and runs the same engine on each one as it closes,
+against the paper broker. It prints a row per bar and every simulated fill, and
+runs until you interrupt it or `--max-bars` is reached.
+
+Three things it does deliberately:
+
+- **Only closed bars are traded.** A bar still forming has a price that can
+  still move; Binance's most recent kline is dropped for exactly this reason.
+- **`--warmup 200` replays history first**, so a 200-period average is ready
+  before the first live bar. A freshly started bot is otherwise blind for as
+  many bars as its slowest indicator needs.
+- **It does not liquidate when the session ends.** Stopping the loop is not a
+  decision to close the position, so the open position is reported instead.
+
+It still places no real orders. It is a simulator being fed live prices.
 
 ## Strategies
 
@@ -110,6 +169,17 @@ print(result.summary())
 print(result.metrics.sharpe_ratio, result.metrics.max_drawdown)
 for trade in result.trades:
     print(trade.entry_time, trade.pnl)
+```
+
+Real prices, from Python:
+
+```python
+from trading_bot import MarketDataFeed, build_provider
+
+provider = build_provider("yahoo", cache_dir=".cache/market-data")
+feed = MarketDataFeed(provider, "AAPL", interval="1d", limit=1000)
+for candle in feed:
+    print(candle.timestamp, candle.close)
 ```
 
 Or assemble the pieces yourself:
@@ -198,9 +268,32 @@ losers is noise — not as a way to pick the winner.
 python -m unittest discover -s tests
 ```
 
-193 tests covering position accounting through to the CLI. The ones worth
+277 tests covering position accounting through to the CLI. The ones worth
 knowing about assert properties that are easy to get quietly wrong: that a
 signal cannot be filled on its own bar, that buy-and-hold produces exactly one
 round trip (an early version churned 33 times as its fixed-fraction target
 drifted), that exits are never blocked by buying power, and that a drawdown halt
 is permanent.
+
+The provider tests run against recorded response bodies rather than the
+network, and they cover each API's awkward corners: Yahoo pads holidays with
+nulls, Coinbase orders its columns `low, high, open, close` and returns rows
+newest-first, Binance's last kline is usually still forming, and Stooq reports
+errors as HTTP 200 with a plain-text body.
+
+**The live providers have not been exercised against the real endpoints.** They
+were built and tested in a sandbox whose egress policy blocks every market-data
+host, so the URL construction and response parsing are verified only against
+those recorded fixtures. The shapes match each API's documented format, but
+treat the first real call as unverified. This checks all four in one go:
+
+```bash
+for p in stooq yahoo binance coinbase; do
+  case $p in
+    stooq|yahoo) s=AAPL ;; binance) s=BTCUSDT ;; coinbase) s=BTC-USD ;;
+  esac
+  echo "== $p $s"
+  python -m trading_bot fetch --provider $p --symbol $s --limit 5 --no-cache \
+      --out /tmp/$p.csv || echo "FAILED"
+done
+```

@@ -68,6 +68,27 @@ class TestComputeMetrics(unittest.TestCase):
         metrics = compute_metrics(points, [])
         self.assertAlmostEqual(metrics.cagr, 0.5, places=1)
 
+    def test_short_intraday_session_does_not_overflow(self):
+        # Annualising a five-minute session raises the return ratio to roughly
+        # the 100,000th power, which used to raise OverflowError.
+        points = curve([100_000 + i * 50 for i in range(6)], step=timedelta(minutes=1))
+        metrics = compute_metrics(points, [])
+        self.assertFalse(metrics.annualised)
+        self.assertAlmostEqual(metrics.cagr, metrics.total_return)
+        self.assertIn("Period return", metrics.format_report())
+
+    def test_a_long_run_is_annualised(self):
+        points = curve([100 + i for i in range(400)], step=timedelta(days=1))
+        metrics = compute_metrics(points, [])
+        self.assertTrue(metrics.annualised)
+        self.assertIn("CAGR", metrics.format_report())
+
+    def test_a_collapse_over_a_short_window_does_not_overflow(self):
+        points = curve([100_000, 1.0], step=timedelta(minutes=1))
+        metrics = compute_metrics(points, [])
+        self.assertFalse(metrics.annualised)
+        self.assertAlmostEqual(metrics.total_return, -0.99999)
+
     def test_flat_curve_has_zero_volatility_and_sharpe(self):
         metrics = compute_metrics(curve([100] * 20), [])
         self.assertAlmostEqual(metrics.annual_volatility, 0.0)

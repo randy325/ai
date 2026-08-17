@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from pathlib import Path
 
 from .broker import Commission, PaperBroker, SlippageModel
 from .data import CSVFeed, DataFeed, SyntheticFeed
 from .engine import TradingEngine
+from .providers import LiveFeed, MarketDataFeed, Provider, build_provider
 from .risk import FixedFractionSizer, PositionSizer, RiskLimits, RiskManager, VolatilitySizer
 from .strategy import Strategy, TrendFilter, build_strategy
 
@@ -21,6 +23,11 @@ class RunConfig:
     strategy_params: dict = field(default_factory=dict)
     symbol: str = "SYNTH"
     data_file: str | None = None
+    provider: str | None = None
+    interval: str = "1d"
+    limit: int = 500
+    cache_dir: str | None = ".cache/market-data"
+    cache_hours: float = 12.0
     bars: int = 750
     seed: int = 7
     volatility: float = 0.25
@@ -63,9 +70,25 @@ class RunConfig:
 
     # -- component factories -------------------------------------------------
 
+    def build_provider(self) -> Provider:
+        """The configured live-data provider, wrapped in a disk cache."""
+        if not self.provider:
+            raise ValueError("no provider configured")
+        return build_provider(
+            self.provider,
+            cache_dir=self.cache_dir or None,
+            cache_ttl=timedelta(hours=self.cache_hours),
+        )
+
     def build_feed(self) -> DataFeed:
+        # A data file wins over a provider: local data is explicit, and it is
+        # what you want when reproducing a run exactly.
         if self.data_file:
             return CSVFeed(self.data_file, symbol=self.symbol)
+        if self.provider:
+            return MarketDataFeed(
+                self.build_provider(), self.symbol, self.interval, self.limit
+            )
         return SyntheticFeed(
             symbol=self.symbol,
             bars=self.bars,
@@ -116,6 +139,21 @@ class RunConfig:
             max_trades_per_day=self.max_trades_per_day,
         )
         return RiskManager(limits, self.build_sizer())
+
+    def build_live_feed(self, warmup: int = 200, max_bars: int | None = None) -> LiveFeed:
+        """A polling feed that yields each bar as it closes.
+
+        Never cached — a cache would serve a stale bar as if it were new.
+        """
+        if not self.provider:
+            raise ValueError("live paper trading needs --provider")
+        return LiveFeed(
+            provider=build_provider(self.provider),
+            symbol=self.symbol,
+            interval=self.interval,
+            warmup=warmup,
+            max_bars=max_bars,
+        )
 
     def build_engine(self) -> TradingEngine:
         return TradingEngine(

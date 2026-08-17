@@ -10,6 +10,12 @@ from .models import EquityPoint, Trade
 
 TRADING_DAYS_PER_YEAR = 252
 
+MIN_YEARS_TO_ANNUALISE = 7 / 365.25
+"""Below one week, annualising is meaningless and numerically explosive: a 5
+minute session raises the return ratio to the ~100,000th power, which overflows
+long before it says anything about a year. Short runs report the period return
+instead, and ``Metrics.annualised`` records which one you are looking at."""
+
 
 @dataclass
 class Metrics:
@@ -33,6 +39,9 @@ class Metrics:
     largest_loss: float = 0.0
     expectancy: float = 0.0
     total_commission: float = 0.0
+    #: False when the run was too short to annualise; ``cagr`` is then the
+    #: plain period return, and Calmar is derived from it.
+    annualised: bool = False
     start: datetime | None = None
     end: datetime | None = None
     extras: dict = field(default_factory=dict)
@@ -59,7 +68,7 @@ class Metrics:
             ("Starting equity", f"${self.starting_equity:,.2f}"),
             ("Ending equity", f"${self.ending_equity:,.2f}"),
             ("Total return", f"{self.total_return:+.2%}"),
-            ("CAGR", f"{self.cagr:+.2%}"),
+            ("CAGR" if self.annualised else "Period return", f"{self.cagr:+.2%}"),
             ("Annual volatility", f"{self.annual_volatility:.2%}"),
             ("Sharpe ratio", f"{self.sharpe_ratio:.2f}"),
             ("Sortino ratio", f"{self.sortino_ratio:.2f}"),
@@ -155,9 +164,18 @@ def compute_metrics(
 
     elapsed_days = max((metrics.end - metrics.start).total_seconds() / 86_400, 0.0)
     years = elapsed_days / 365.25
-    if years > 0 and metrics.starting_equity > 0 and metrics.ending_equity > 0:
-        metrics.cagr = (metrics.ending_equity / metrics.starting_equity) ** (1 / years) - 1.0
-    elif metrics.starting_equity > 0:
+    if (
+        years >= MIN_YEARS_TO_ANNUALISE
+        and metrics.starting_equity > 0
+        and metrics.ending_equity > 0
+    ):
+        try:
+            metrics.cagr = (metrics.ending_equity / metrics.starting_equity) ** (1 / years) - 1.0
+            metrics.annualised = True
+        except OverflowError:
+            metrics.cagr = math.inf if metrics.ending_equity > metrics.starting_equity else -1.0
+            metrics.annualised = True
+    else:
         metrics.cagr = metrics.total_return
 
     if len(returns) > 1:

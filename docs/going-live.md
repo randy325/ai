@@ -34,6 +34,31 @@ results, including the ones you tuned by discarding a strategy and trying
 another, spent some of your data's information. Hold out a period you have never
 looked at, and look at it once.
 
+## What the live feed does and does not change
+
+`trading_bot.providers` fetches real prices, and `paper` runs the engine on
+them as they arrive. That closes the data gap, not the execution gap. The
+broker is still simulated: every fill is invented at the next bar's open plus
+an assumed slippage, so a live paper session tells you what your strategy
+*signals* in real conditions, not what it would have been *filled* at.
+
+The free providers also come with caveats worth knowing before you trust a
+result built on them:
+
+- **They are unofficial.** Yahoo's chart endpoint is undocumented and has
+  changed shape before; Stooq rate-limits by IP and reports it as a plain-text
+  body with an HTTP 200. Handle a provider disappearing as a matter of when.
+- **Free data is unadjusted or inconsistently adjusted.** A split or dividend
+  can appear as a gap that a breakout strategy reads as a real move. Stooq
+  serves adjusted history; Yahoo's `close` is unadjusted while its `adjclose`
+  is not, and this package reads `close`.
+- **Crypto trades continuously, equities do not.** An overnight gap is not a
+  bar, and the annualisation in `metrics.py` infers bar frequency from median
+  spacing — reasonable, but an assumption.
+- **Bars are labelled by opening time** here, matching what the providers
+  return. Check this before comparing results against another tool; the
+  off-by-one-bar error it causes is easy to miss and flatters results.
+
 ## What a live adapter would need
 
 To place real orders, `PaperBroker` would need a sibling implementing the same

@@ -1,8 +1,11 @@
 """Command line interface.
 
+    python -m trading_bot backtest --provider yahoo --symbol AAPL
     python -m trading_bot backtest --strategy sma-crossover --data prices.csv
     python -m trading_bot compare --bars 1000
     python -m trading_bot optimize --strategy sma-crossover
+    python -m trading_bot fetch --provider binance --symbol BTCUSDT --limit 1000
+    python -m trading_bot paper --provider binance --symbol BTCUSDT --interval 1m
     python -m trading_bot demo-data --out data/demo.csv
 """
 
@@ -14,17 +17,31 @@ import itertools
 import json
 import logging
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 from .config import RunConfig
 from .data import SyntheticFeed, write_csv
 from .engine import BacktestResult
+from .providers import INTERVAL_SECONDS, PROVIDERS, DataFeedError, build_provider
 from .strategy import STRATEGIES
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     data = parser.add_argument_group("data")
     data.add_argument("--data", dest="data_file", help="CSV file of OHLCV bars")
+    data.add_argument("--provider", choices=sorted(PROVIDERS),
+                      help="fetch real market prices from this provider")
+    data.add_argument("--interval", default="1d", choices=sorted(INTERVAL_SECONDS),
+                      help="bar size for --provider (default: 1d)")
+    data.add_argument("--limit", type=int, default=500,
+                      help="bars to fetch from --provider (default: 500)")
+    data.add_argument("--cache-dir", default=".cache/market-data",
+                      help="where to cache provider responses")
+    data.add_argument("--no-cache", action="store_true",
+                      help="bypass the response cache and always refetch")
+    data.add_argument("--cache-hours", type=float, default=12.0,
+                      help="how long a cached response stays fresh (default: 12)")
     data.add_argument("--symbol", default="SYNTH", help="symbol name (default: SYNTH)")
     data.add_argument("--bars", type=int, default=750, help="synthetic bars when no --data")
     data.add_argument("--seed", type=int, default=7, help="synthetic data seed")
@@ -115,7 +132,15 @@ def _config_from_args(args: argparse.Namespace, strategy: str | None = None) -> 
         take("strategy", args.strategy)
 
     take("data", args.data_file, "data_file")
+    take("provider", args.provider)
+    take("interval", args.interval)
+    take("limit", args.limit)
+    take("cache_hours", args.cache_hours)
     take("symbol", args.symbol)
+    if args.no_cache:
+        config.cache_dir = None
+    else:
+        take("cache_dir", args.cache_dir)
     take("bars", args.bars)
     take("seed", args.seed)
     take("volatility", args.volatility)
@@ -307,6 +332,96 @@ def cmd_demo_data(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fetch(args: argparse.Namespace) -> int:
+    """Download real bars and save them as a CSV the other commands can read."""
+    provider = build_provider(
+        args.provider,
+        cache_dir=None if args.no_cache else args.cache_dir,
+        cache_ttl=timedelta(hours=args.cache_hours),
+    )
+    candles = provider.fetch(args.symbol, args.interval, args.limit)
+    destination = Path(args.out or f"data/{args.symbol.replace('/', '-').lower()}.csv")
+    write_csv(candles, destination)
+    print(
+        f"Fetched {len(candles)} {args.interval} bars of {args.symbol.upper()} "
+        f"from {provider.name}"
+    )
+    print(f"  {candles[0].timestamp:%Y-%m-%d %H:%M} to {candles[-1].timestamp:%Y-%m-%d %H:%M} UTC")
+    print(f"  last close {candles[-1].close:,.4f}")
+    print(f"  written to {destination}")
+    return 0
+
+
+def cmd_providers(args: argparse.Namespace) -> int:
+    print("Live data providers (no API key required)\n")
+    for name, factory in sorted(PROVIDERS.items()):
+        doc = (factory.__doc__ or "").strip().splitlines()
+        print(f"  {name:<10} {doc[0] if doc else ''}")
+        print(f"  {'':<10} intervals: {', '.join(factory.intervals)}")
+    print("\nSymbol formats: stooq aapl.us / ^spx, yahoo AAPL, "
+          "binance BTCUSDT, coinbase BTC-USD")
+    print("Example: python -m trading_bot backtest --provider yahoo --symbol AAPL")
+    return 0
+
+
+def cmd_paper(args: argparse.Namespace) -> int:
+    """Paper-trade live bars as they close. Places no real orders."""
+    config = _config_from_args(args)
+    if not config.provider:
+        print("error: paper trading needs --provider", file=sys.stderr)
+        return 2
+
+    engine = config.build_engine()
+    engine.close_at_end = False
+    feed = config.build_live_feed(warmup=args.warmup, max_bars=args.max_bars)
+
+    print(
+        f"Paper trading {config.symbol} {config.interval} bars from {config.provider}.\n"
+        f"Strategy: {engine.strategy.describe()}\n"
+        f"Starting cash: ${config.starting_cash:,.2f}   "
+        f"{'Bars: ' + str(args.max_bars) if args.max_bars else 'Running until interrupted'}\n"
+        "No real orders are placed. Press Ctrl-C to stop.\n"
+    )
+
+    print(f"Warming up on {args.warmup} historical bars, then waiting for the next close.\n")
+    print(f"{'time':<17}{'close':>12}{'equity':>14}{'target':>8}  signal")
+    print("-" * 78)
+
+    def on_bar(candle, signal, equity):
+        # Warmup bars are history; only narrate what is happening now.
+        if feed.live_bars == 0:
+            return
+        print(
+            f"{candle.timestamp:%Y-%m-%d %H:%M}{candle.close:>12,.4f}"
+            f"{equity:>14,.2f}{signal.target:>8.1f}  {signal.reason}"
+        )
+
+    engine.on_bar = on_bar
+    engine.on_fill = lambda fill: print(
+        f"  -> {fill.side.value.upper()} {fill.quantity:,.6f} @ {fill.price:,.4f} "
+        f"(fee {fill.commission:,.2f})"
+    )
+
+    try:
+        result = engine.run(feed)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        result = None
+    except DataFeedError as exc:
+        print(f"\nfeed stopped: {exc}", file=sys.stderr)
+        result = None
+
+    broker = engine.broker
+    print(f"\nFinal equity ${broker.equity():,.2f} "
+          f"({broker.equity() / config.starting_cash - 1:+.2%})")
+    position = broker.position(config.symbol)
+    if not position.is_flat:
+        print(f"Open position: {position.quantity:+,.6f} @ {position.average_price:,.4f}")
+    if result is not None and result.trades:
+        print(result.metrics.format_report(f"Live paper session: {config.symbol}"))
+    return 0
+
+
 def cmd_strategies(args: argparse.Namespace) -> int:
     print("Available strategies\n")
     for name, factory in sorted(STRATEGIES.items()):
@@ -360,6 +475,31 @@ def build_parser() -> argparse.ArgumentParser:
     strategies = subparsers.add_parser("strategies", help="list available strategies")
     strategies.set_defaults(func=cmd_strategies)
 
+    fetch = subparsers.add_parser("fetch", help="download real market bars to a CSV file")
+    fetch.add_argument("--provider", required=True, choices=sorted(PROVIDERS))
+    fetch.add_argument("--symbol", required=True, help="e.g. AAPL, BTCUSDT, BTC-USD")
+    fetch.add_argument("--interval", default="1d", choices=sorted(INTERVAL_SECONDS))
+    fetch.add_argument("--limit", type=int, default=500, help="how many bars to fetch")
+    fetch.add_argument("--out", help="output path (default: data/<symbol>.csv)")
+    fetch.add_argument("--cache-dir", default=".cache/market-data")
+    fetch.add_argument("--cache-hours", type=float, default=12.0)
+    fetch.add_argument("--no-cache", action="store_true")
+    fetch.set_defaults(func=cmd_fetch)
+
+    providers = subparsers.add_parser("providers", help="list live data providers")
+    providers.set_defaults(func=cmd_providers)
+
+    paper = subparsers.add_parser(
+        "paper", help="paper-trade live bars as they close (places no real orders)"
+    )
+    paper.add_argument("--strategy", default="sma-crossover", choices=sorted(STRATEGIES))
+    paper.add_argument("--warmup", type=int, default=200,
+                       help="historical bars to prime indicators (default: 200)")
+    paper.add_argument("--max-bars", type=int, default=None,
+                       help="stop after this many live bars")
+    _add_common_arguments(paper)
+    paper.set_defaults(func=cmd_paper)
+
     return parser
 
 
@@ -374,7 +514,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         return args.func(args)
-    except (FileNotFoundError, ValueError, KeyError) as exc:
+    except (FileNotFoundError, ValueError, KeyError, DataFeedError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:  # pragma: no cover

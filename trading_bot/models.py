@@ -26,7 +26,13 @@ class OrderType(str, Enum):
 
 @dataclass(frozen=True)
 class Candle:
-    """One OHLCV bar. ``timestamp`` marks the close of the bar."""
+    """One OHLCV bar.
+
+    ``timestamp`` identifies the bar. Every feed here labels a bar by its
+    opening time, which is what the data providers return; what matters is that
+    a feed is internally consistent, since the engine only ever acts on a bar
+    that has already completed.
+    """
 
     timestamp: datetime
     open: float
