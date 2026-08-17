@@ -177,8 +177,10 @@ MOCK_WARNING = (
 
 
 def _warn_if_mock(provider: str | None) -> None:
+    # Advisory, not data: stderr keeps stdout parseable under --json while
+    # still showing the warning in a terminal.
     if provider == "mock":
-        print(f"\n{MOCK_WARNING}")
+        print(f"\n{MOCK_WARNING}", file=sys.stderr)
 
 
 def _run(config: RunConfig) -> BacktestResult:
@@ -198,7 +200,8 @@ def _export(result: BacktestResult, equity_path: str | None, trades_path: str | 
                     [point.timestamp.isoformat(), f"{point.cash:.2f}",
                      f"{point.equity:.2f}", f"{point.exposure:.4f}"]
                 )
-        print(f"\nEquity curve written to {destination}")
+        # Status, not data: stdout must stay parseable under --json.
+        print(f"Equity curve written to {destination}", file=sys.stderr)
 
     if trades_path:
         destination = Path(trades_path)
@@ -217,7 +220,7 @@ def _export(result: BacktestResult, equity_path: str | None, trades_path: str | 
                      f"{trade.pnl:.2f}", f"{trade.return_pct:.4f}",
                      f"{trade.commission:.2f}", trade.reason]
                 )
-        print(f"Trade log written to {destination}")
+        print(f"Trade log written to {destination}", file=sys.stderr)
 
 
 def cmd_backtest(args: argparse.Namespace) -> int:

@@ -114,6 +114,20 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Trades", out)
 
+    def test_json_stdout_stays_parseable_alongside_exports(self):
+        # Export notices are status, not data; on stdout they corrupt --json.
+        equity = self.dir / "e.csv"
+        trades = self.dir / "t.csv"
+        code, out, err = self.run_cli(
+            ["backtest", "--bars", "300", "--strategy", "macd-trend", "--json",
+             "--export-equity", str(equity), "--export-trades", str(trades)]
+        )
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertIn("metrics", payload)
+        self.assertIn("written to", err)
+        self.assertTrue(equity.exists() and trades.exists())
+
     def test_compare_ranks_strategies(self):
         code, out, _ = self.run_cli(["compare", "--bars", "300"])
         self.assertEqual(code, 0)

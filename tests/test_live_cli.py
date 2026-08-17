@@ -315,27 +315,29 @@ class TestLiveCLI(unittest.TestCase):
             ["backtest", "--provider", "mock", "--symbol", "MOCK", "--limit", "200", "--no-cache"],
             ["compare", "--provider", "mock", "--symbol", "MOCK", "--limit", "200", "--no-cache"],
         ):
-            code, out, _ = self.run_cli(argv)
+            code, out, err = self.run_cli(argv)
             self.assertEqual(code, 0, argv[0])
-            self.assertIn("measure nothing about the strategy", out, argv[0])
+            self.assertIn("measure nothing about the strategy", err, argv[0])
+            self.assertNotIn("measure nothing", out, argv[0])
 
     def test_paper_results_carry_the_mock_warning(self):
         # A live mock session prints the most flattering numbers of the lot.
-        code, out, _ = self.run_cli(
+        code, out, err = self.run_cli(
             ["paper", "--provider", "mock", "--symbol", "MOCK", "--interval", "1m",
              "--strategy", "buy-and-hold", "--warmup", "20", "--max-bars", "3",
              "--speed", "500000"]
         )
         self.assertEqual(code, 0)
-        self.assertIn("measure nothing about the strategy", out)
+        self.assertIn("measure nothing about the strategy", err)
 
     def test_real_provider_results_carry_no_mock_warning(self):
         with mock.patch.object(config_module, "build_provider", stub_stooq):
-            code, out, _ = self.run_cli(
+            code, out, err = self.run_cli(
                 ["backtest", "--provider", "stooq", "--symbol", "AAPL", "--no-cache"]
             )
         self.assertEqual(code, 0)
         self.assertNotIn("measure nothing", out)
+        self.assertNotIn("measure nothing", err)
 
     def test_fetch_works_offline_with_the_mock_provider(self):
         path = self.dir / "mock.csv"
