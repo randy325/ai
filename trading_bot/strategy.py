@@ -88,25 +88,25 @@ class RSIMeanReversion(Strategy):
     for anyone tuning later, so passing it without shorting is an error rather
     than a no-op.
 
-    **Sweep stability: no measurement available.** An earlier note here
-    reported ``oversold`` as having a SPIKY parameter surface, at 63% roughness
-    against a 25% reference. That finding is **retracted**. The threshold it
-    used was a hardcoded 0.5, which sits on the *mean* of the statistic's null
-    distribution for a five-point sweep — pure noise scores 0.49 on average and
-    exceeds 0.5 about 42% of the time, so the label carried no information. The
-    63% reading falls below the 95th percentile of that null (about 0.70) and
-    was a false positive.
+    **Sweep stability: bounded, not measured.** An earlier note here reported
+    ``oversold`` as SPIKY at 63% roughness. That is **retracted** — the
+    threshold it used sat on the mean of the statistic's null for a five-point
+    sweep, where pure noise scores 0.49 and exceeds 0.5 about 42% of the time.
 
-    Recalibrated against the null and run at 15 settings x 25 seeds, every
-    parameter of every strategy here comes back UNRESOLVED: the spread between
-    settings is smaller than the sampling error within them. Escalating to 400
-    seeds does not help, because the noise-corrected signal is zero — a
-    geometric random walk has no parameter-dependent structure for a sweep to
-    find, so there is nothing to resolve at any sample size.
+    Recalibrated at 15 settings x 25 seeds, no parameter here shows a surface
+    separable from sampling noise, and none shows a monotone trend at p<0.05.
+    That is a **bound, not an absence**: the positive control puts the smallest
+    detectable end-to-end effect at about 2% at this sample size, so effects
+    larger than that are ruled out and smaller ones are not.
 
-    The practical consequence: synthetic data cannot validate these thresholds
-    in either direction. Treat 30.0 as an untested default, and run
-    ``scripts/robustness_sweep.py`` against real bars if you need an answer.
+    Two caveats on any synthetic verdict. Effects do exist outside the ±30%
+    window — over a 16x range of ``rsi-breakout``'s ``lookback`` the response is
+    strictly monotone at p=0.017 — so "no trend within ±30%" is a statement
+    about the window, not the parameter. And on this feed mean return tracks
+    mean trade count at r=+0.94 against a positive-drift generator, so what a
+    sweep mostly measures is time in market rather than strategy quality.
+
+    Treat 30.0 as an untested default and use real bars for a real answer.
     """
 
     name = "rsi-mean-reversion"

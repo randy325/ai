@@ -255,6 +255,97 @@ class TestStrategyParameterDiscovery(unittest.TestCase):
         self.assertNotIn("mode", params)
 
 
+class TestDetectionFloor(unittest.TestCase):
+    """A clamped estimate must never be reported as a measurement of zero."""
+
+    def test_a_clamped_signal_is_labelled_not_zeroed(self):
+        text = sweep.describe_signal(between=0.01, within=0.03, true_between=0.0)
+        self.assertIn("below detection floor", text)
+        self.assertNotIn("0.00%", text)
+
+    def test_a_resolved_signal_reports_its_value_and_floor(self):
+        text = sweep.describe_signal(between=0.10, within=0.02, true_between=0.098)
+        self.assertIn("9.8", text)
+        self.assertIn("floor", text)
+
+    def test_the_floor_scales_with_the_within_point_error(self):
+        self.assertGreater(sweep.detection_floor(0.05), sweep.detection_floor(0.01))
+
+    def test_repeated_clamps_are_not_independent_measurements(self):
+        # Three seed counts all bottoming out is one floor hit three times.
+        # Each must describe itself as bounded, never as a measured zero.
+        for within in (0.07, 0.04, 0.02):
+            text = sweep.describe_signal(between=within * 0.5, within=within,
+                                         true_between=0.0)
+            self.assertIn("below detection floor", text)
+
+
+class TestMonotonicTrend(unittest.TestCase):
+    """Ordering is exactly what roughness discards, so it needs its own test."""
+
+    def test_spearman_handles_perfect_orderings(self):
+        self.assertAlmostEqual(sweep.spearman([1, 2, 3, 4], [1, 2, 3, 4]), 1.0)
+        self.assertAlmostEqual(sweep.spearman([1, 2, 3, 4], [4, 3, 2, 1]), -1.0)
+
+    def test_spearman_is_safe_on_ties(self):
+        self.assertAlmostEqual(sweep.spearman([1, 1, 1], [1, 2, 3]), 0.0)
+
+    def test_a_monotone_ramp_is_the_smoothest_possible_sequence(self):
+        # The reason a real trend is invisible to roughness: it scores the
+        # minimum, so it looks maximally unremarkable.
+        ramp = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+        self.assertAlmostEqual(sweep.roughness(ramp), sweep.smooth_reference(7), places=6)
+        self.assertEqual(sweep.classify_roughness(sweep.roughness(ramp), 7), "smooth")
+
+    def test_a_trend_invisible_to_roughness_is_caught_by_the_trend_test(self):
+        rng = random.Random(21)
+        values = list(range(9))
+        # Effect far smaller than the per-seed noise, but consistent in sign.
+        per_seed = [
+            [i * -0.004 + rng.gauss(0.0, 0.05) for _ in range(60)] for i in range(9)
+        ]
+        _, _, ratio, _ = sweep.resolving_power(per_seed)
+        trend = sweep.monotonic_trend(values, per_seed)
+        self.assertLess(ratio, 2.0, "the variance ratio should miss this")
+        self.assertLess(trend["p"], 0.05, "the trend test should catch it")
+        self.assertLess(trend["rho"], 0)
+
+    def test_no_trend_on_pure_noise(self):
+        rng = random.Random(22)
+        per_seed = [[rng.gauss(0.0, 0.05) for _ in range(60)] for _ in range(9)]
+        self.assertGreater(sweep.monotonic_trend(list(range(9)), per_seed)["p"], 0.05)
+
+    def test_degenerate_input_is_safe(self):
+        self.assertEqual(sweep.monotonic_trend([1, 2], [[0.1], [0.2]])["p"], 1.0)
+
+
+class TestPositiveControl(unittest.TestCase):
+    """The null test alone is unfalsifiable: a broken detector also passes it."""
+
+    def test_zero_effect_fires_at_about_the_alpha_rate(self):
+        rate = sweep.positive_control(effect=0.0, points=9, seeds=25, trials=200)
+        self.assertLess(rate, 0.12, "a detector that fires on nothing is broken")
+
+    def test_a_large_effect_is_detected_essentially_always(self):
+        rate = sweep.positive_control(effect=0.20, points=9, seeds=25, trials=100)
+        self.assertGreater(rate, 0.90,
+                           "a detector that never fires would pass the null test too")
+
+    def test_detection_rate_rises_with_effect_size(self):
+        small = sweep.positive_control(effect=0.01, points=9, seeds=25, trials=150)
+        large = sweep.positive_control(effect=0.10, points=9, seeds=25, trials=150)
+        self.assertGreater(large, small)
+
+    def test_more_seeds_lower_the_minimum_detectable_effect(self):
+        few = sweep.minimum_detectable_effect(9, 10, trials=60)
+        many = sweep.minimum_detectable_effect(9, 200, trials=60)
+        self.assertGreaterEqual(few, many)
+
+    def test_the_minimum_detectable_effect_is_finite_at_the_defaults(self):
+        mde = sweep.minimum_detectable_effect(15, 25, trials=60)
+        self.assertLess(mde, 0.10, "the sweep must be able to see something")
+
+
 class TestOfflineEvaluation(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

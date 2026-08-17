@@ -136,6 +136,107 @@ def classify_roughness(value: float, count: int, alpha: float = 0.05) -> str:
     return "noise"
 
 
+def positive_control(
+    effect: float,
+    points: int,
+    seeds: int,
+    noise: float = 0.10,
+    trials: int = 200,
+    seed: int = 4242,
+) -> float:
+    """Detection rate for an injected linear effect of known size.
+
+    The null test proves the detector will not fire on noise. On its own that
+    is worthless as evidence, because a detector wired to "no" passes it
+    perfectly — "no resolving power" and "the instrument is broken" look
+    identical. This is the complement: a surface with a KNOWN trend, to
+    confirm the detector fires when it should and to measure how small an
+    effect it can still see.
+
+    ``effect`` is the total return difference across the whole parameter range.
+    """
+    rng = random.Random(seed)
+    values = list(range(points))
+    detected = 0
+    for _ in range(trials):
+        step = effect / (points - 1)
+        # Seeds are shared across settings, exactly as in a real sweep, so the
+        # per-seed path offset is common and the comparison is paired.
+        offsets = [rng.gauss(0.0, noise) for _ in range(seeds)]
+        per_seed = [
+            [i * step + offsets[s] + rng.gauss(0.0, noise / 3.0) for s in range(seeds)]
+            for i in range(points)
+        ]
+        if monotonic_trend(values, per_seed)["p"] < 0.05:
+            detected += 1
+    return detected / trials
+
+
+def minimum_detectable_effect(
+    points: int, seeds: int, noise: float = 0.10, power: float = 0.80, trials: int = 120
+) -> float:
+    """Smallest injected effect the trend test detects at ``power``."""
+    candidates = [0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.12, 0.20, 0.30, 0.50]
+    for effect in candidates:
+        if positive_control(effect, points, seeds, noise, trials=trials) >= power:
+            return effect
+    return math.inf
+
+
+def spearman(a: list[float], b: list[float]) -> float:
+    """Rank correlation between two equal-length sequences."""
+    def ranks(xs):
+        order = sorted(range(len(xs)), key=lambda i: xs[i])
+        out = [0.0] * len(xs)
+        i = 0
+        while i < len(order):
+            j = i
+            while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+                j += 1
+            shared = (i + j) / 2.0
+            for k in range(i, j + 1):
+                out[order[k]] = shared
+            i = j + 1
+        return out
+
+    ra, rb = ranks(a), ranks(b)
+    n = len(a)
+    ma, mb = sum(ra) / n, sum(rb) / n
+    num = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    den = math.sqrt(sum((x - ma) ** 2 for x in ra) * sum((y - mb) ** 2 for y in rb))
+    return num / den if den > 1e-12 else 0.0
+
+
+def monotonic_trend(values: list[float], per_seed: list[list[float]]) -> dict:
+    """Paired test for a monotone relationship between setting and return.
+
+    Roughness is blind to this by construction: a perfectly monotone ramp is
+    the *smoothest* sequence there is, scoring the minimum 1/(n-1), so a real
+    trend looks maximally unremarkable to it. Ordering is exactly the
+    information roughness discards, and a trend test is the statistic that
+    uses it.
+
+    The seeds are shared across settings, so this is paired — each seed sees
+    every setting on the same price path, and its own rank correlation removes
+    the path-to-path variation that dominates the unpaired comparison.
+    """
+    seed_count = min((len(p) for p in per_seed), default=0)
+    if len(values) < 3 or seed_count < 2:
+        return {"rho": 0.0, "sem": 0.0, "t": 0.0, "p": 1.0, "seeds": seed_count}
+
+    rhos = []
+    for s in range(seed_count):
+        column = [per_seed[i][s] for i in range(len(values))]
+        rhos.append(spearman(list(values), column))
+
+    mean_rho = statistics.mean(rhos)
+    sem = statistics.pstdev(rhos) / math.sqrt(len(rhos)) if len(rhos) > 1 else 0.0
+    t = mean_rho / sem if sem > 1e-12 else 0.0
+    # Two-sided normal approximation; seed counts here are large enough.
+    p = math.erfc(abs(t) / math.sqrt(2.0))
+    return {"rho": mean_rho, "sem": sem, "t": t, "p": p, "seeds": len(rhos)}
+
+
 def resolving_power(per_seed: list[list[float]]) -> tuple[float, float, float, float]:
     """Between-point signal against within-point sampling noise.
 
@@ -166,8 +267,31 @@ def resolving_power(per_seed: list[list[float]]) -> tuple[float, float, float, f
     errors = [median_se * statistics.pstdev(p) / math.sqrt(len(p)) for p in points]
     within = statistics.median(errors)
     ratio = between / within if within > 1e-12 else math.inf
-    true_between = math.sqrt(max(between**2 - within**2, 0.0))
+    # Method-of-moments estimate of the true spread. It is NOT clamped here:
+    # a negative raw value means the observed scatter is smaller than the noise
+    # alone predicts, which is information ("below the detection floor"), and
+    # clamping it to zero and printing "0.00%" turns that into a false claim of
+    # measured absence. Callers get both the raw and the floor.
+    raw = between**2 - within**2
+    true_between = math.sqrt(raw) if raw > 0 else 0.0
     return between, within, ratio, true_between
+
+
+def detection_floor(within: float) -> float:
+    """Smallest between-point spread this seed count could distinguish.
+
+    Set at 2x the within-point standard error: below that the ratio cannot
+    reach the threshold at which any shape statistic is readable.
+    """
+    return 2.0 * within
+
+
+def describe_signal(between: float, within: float, true_between: float) -> str:
+    """Human-readable signal estimate that never reports a clamp as zero."""
+    floor = detection_floor(within)
+    if between <= within:
+        return f"below detection floor (<{floor:.2%})"
+    return f"{true_between:.2%} (floor {floor:.2%})"
 
 
 def is_peaked(values: list, returns: list[float], default) -> tuple[bool, float]:
@@ -276,6 +400,7 @@ def main() -> int:
     verdicts = {}
     ratios = []
     signals = []
+    trends = {}
 
     for name, default, results in findings:
         returns = [outcome["return"] for _, outcome in results]
@@ -285,8 +410,10 @@ def main() -> int:
 
         jaggedness = roughness(returns)
         between, within, ratio, true_between = resolving_power(per_seed)
+        trend = monotonic_trend([float(v) for v, _ in results], per_seed)
         ratios.append(ratio)
         signals.append(true_between)
+        trends[name] = trend
         upper = null_percentile(count, 1.0 - args.alpha)
         lower = null_percentile(count, args.alpha)
         shape = classify_roughness(jaggedness, count, args.alpha)
@@ -299,17 +426,27 @@ def main() -> int:
             flags.append(
                 f"{name}: varying it changes nothing — inert in this configuration"
             )
+        elif trend["p"] < args.alpha:
+            # Ordering carries what the variance ratio throws away: a monotone
+            # response is the SMOOTHEST possible sequence by roughness, so a
+            # real trend is invisible to that statistic by construction.
+            direction = "falls" if trend["rho"] < 0 else "rises"
+            verdict = "TREND"
+            flags.append(
+                f"{name}: return {direction} monotonically with the setting "
+                f"(rho {trend['rho']:+.2f}, p={trend['p']:.3f} paired over "
+                f"{trend['seeds']} seeds) — a real response the roughness "
+                "statistic cannot see"
+            )
         elif ratio < 2.0:
             # Point-to-point differences are the same size as the error on each
             # point. Any shape read off this is an artefact of the seed count.
             verdict = "UNRESOLVED"
             flags.append(
-                f"{name}: between-point spread {between:.1%} is only {ratio:.1f}x the "
-                f"within-point standard error {within:.1%}; noise-corrected signal "
-                f"{true_between:.2%} — "
-                + ("there is no surface here to resolve, so more seeds will not help"
-                   if true_between < 1e-9 else
-                   "add seeds before reading anything into the shape")
+                f"{name}: between-point spread {between:.1%} against a within-point "
+                f"standard error of {within:.1%} ({ratio:.1f}x); signal "
+                f"{describe_signal(between, within, true_between)}; no monotone "
+                f"trend either (p={trend['p']:.2f})"
             )
         elif shape == "jagged":
             verdict = "JAGGED"
@@ -333,8 +470,9 @@ def main() -> int:
 
         verdicts[name] = verdict
         print(
-            f"{name:<16}{'':>9}{'rough':>10} {jaggedness:>6.0%}"
-            f"  noise[{lower:.0%}-{upper:.0%}]  resolve {ratio:>4.1f}x   {verdict}"
+            f"{name:<16}{'':>9}{'rough':>7} {jaggedness:>5.0%}"
+            f"  resolve {ratio:>4.1f}x  trend rho {trend['rho']:>+5.2f} "
+            f"p={trend['p']:>5.3f}   {verdict}"
         )
 
     all_returns = [o["return"] for _, _, rs in findings for _, o in rs]
@@ -346,10 +484,16 @@ def main() -> int:
     print(f"  settings tested        : {len(all_returns)}")
     print(f"  points x seeds         : {args.steps} x {args.seeds}")
     median_signal = statistics.median(signals) if signals else 0.0
+    mde = minimum_detectable_effect(args.steps, args.seeds, trials=60)
     print(f"  median resolving power : {median_ratio:.1f}x "
           f"(between-point spread / within-point standard error; >2 to read anything)")
-    print(f"  median true signal     : {median_signal:.2%} "
-          "(noise-corrected between-point spread)")
+    print(f"  median signal estimate : {median_signal:.2%} "
+          "(0 here means below the floor, not measured absence)")
+    print(f"  min detectable effect  : {mde:.1%} end-to-end at {args.steps}x{args.seeds}, "
+          "80% power (positive control)")
+    trending = [n for n, tr in trends.items() if tr["p"] < args.alpha]
+    print(f"  monotone trends found  : {len(trending)}/{len(trends)}"
+          + (f" ({', '.join(trending)})" if trending else ""))
     print(f"  parameters resolved    : {len(resolved)}/{len(verdicts)}")
     print(f"  median across sweep    : {statistics.median(all_returns):+.1%}")
     print(f"  baseline               : {baseline['return']:+.1%}")
@@ -359,16 +503,16 @@ def main() -> int:
         for flag in flags:
             print(f"    - {flag}")
 
-    if not resolved:
-        print("\n  NO RESOLVING POWER. Every parameter's surface is within sampling")
-        print("  noise, so the sweep supports no conclusion about shape either way.")
-        if median_signal < 1e-9:
-            print("  The noise-corrected signal is zero: the surface is genuinely flat,")
-            print("  which is what a random walk should produce — it has no structure")
-            print("  for a parameter to exploit. More seeds will NOT help, because")
-            print("  there is no signal to resolve. Only real data can answer this.")
-        else:
-            print("  Raise --seeds and --steps and re-run.")
+    if trending:
+        print("\n  TREND DETECTED. At least one parameter has a monotone effect on")
+        print("  return. See the mechanism note below before reading it as strategy")
+        print("  quality — on this data it is most likely exposure, not edge.")
+    elif not resolved:
+        print("\n  BELOW DETECTION FLOOR. No parameter's surface is separable from")
+        print(f"  sampling noise, and no monotone trend clears p<{args.alpha}. The")
+        print(f"  positive control puts the smallest detectable effect at {mde:.1%}")
+        print("  end-to-end here, so this rules out effects larger than that and")
+        print("  says nothing about smaller ones. It is NOT evidence of no effect.")
     elif any(v in {"JAGGED", "PEAKED"} for v in verdicts.values()):
         print("\n  TUNED-LOOKING parameters found. The flagged ones are significantly")
         print("  rougher than noise or sit on isolated peaks; widen or remove them.")
@@ -384,6 +528,14 @@ def main() -> int:
     print("  random walk, where there is no structure to exploit and costs are real.")
     print("  They are not evidence against the strategy, and a profitable sweep here")
     print("  would be evidence of a bug rather than an edge.")
+    print()
+    print("  MECHANISM WARNING. On this synthetic feed, mean return tracks mean")
+    print("  trade count at about r=+0.94, and the generator has positive drift.")
+    print("  What varies with a parameter here is therefore mostly TIME IN MARKET,")
+    print("  and a setting that looks good is most likely one that stays invested")
+    print("  longer to collect more drift. That is a property of the data, not of")
+    print("  the strategy, and it is a reason to distrust synthetic parameter")
+    print("  sweeps categorically rather than merely to run them with more seeds.")
 
     print(f"\n{BANNER}")
     print("Synthetic data cannot tell you whether this strategy has an edge.")
