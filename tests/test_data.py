@@ -173,3 +173,67 @@ class TestCandleFeed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestErrorBodyDiagnosis(unittest.TestCase):
+    """A refused download saves as .csv and must be named as such.
+
+    Providers answer a rejected request with a short message or an HTML error
+    page. Both save happily as ``spy.csv``, and the column-detection failure
+    they used to produce sent people hunting for a formatting problem that did
+    not exist.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def write(self, text, name="spy.csv"):
+        path = self.dir / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_stooq_access_denied_is_named(self):
+        from trading_bot.data import CSVFeed
+        with self.assertRaises(ValueError) as ctx:
+            list(CSVFeed(self.write("Access denied")))
+        message = str(ctx.exception)
+        self.assertIn("not market data", message)
+        self.assertIn("refused", message)
+        self.assertNotIn("missing required column", message)
+
+    def test_rate_limit_body_is_named(self):
+        from trading_bot.data import CSVFeed
+        with self.assertRaises(ValueError) as ctx:
+            list(CSVFeed(self.write("Exceeded the daily hits limit")))
+        self.assertIn("rate limit", str(ctx.exception))
+
+    def test_html_error_page_is_named(self):
+        from trading_bot.data import CSVFeed
+        with self.assertRaises(ValueError) as ctx:
+            list(CSVFeed(self.write("<!DOCTYPE html><html><body>403</body></html>")))
+        self.assertIn("HTML", str(ctx.exception))
+
+    def test_empty_file_is_named(self):
+        from trading_bot.data import CSVFeed
+        with self.assertRaises(ValueError) as ctx:
+            list(CSVFeed(self.write("   \n")))
+        self.assertIn("empty", str(ctx.exception))
+
+    def test_real_data_is_untouched(self):
+        from trading_bot.data import CSVFeed
+        path = self.write("Date,Open,High,Low,Close,Volume\n2024-01-02,1,2,0.5,1.5,100\n")
+        self.assertEqual(len(list(CSVFeed(path))), 1)
+
+    def test_a_symbol_containing_a_marker_word_still_parses(self):
+        # "No data" appears inside a legitimate header comment position only as
+        # a body; a real CSV whose first bytes are column names must survive.
+        from trading_bot.data import CSVFeed, diagnose_error_body
+        self.assertIsNone(diagnose_error_body("Date,Open,High,Low,Close\n2024-01-02,1,2,0.5,1.5\n"))
+
+    def test_diagnosis_returns_none_for_plausible_data(self):
+        from trading_bot.data import diagnose_error_body
+        self.assertIsNone(diagnose_error_body("timestamp,close\n2020-01-01,100\n"))

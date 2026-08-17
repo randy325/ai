@@ -436,6 +436,14 @@ the evaluation at a directory instead.
 4. Save it as `data/manual/<symbol>.csv` — the filename becomes the instrument
    name, so `spy.us.csv` is better renamed `spy.csv`.
 
+**If the download returns `Access denied`**, Stooq refused the request rather
+than the network failing. It rejects direct fetches that arrive without a
+browser session, and rate-limits by IP. Open the quote page in a browser first
+so the session cookie is set, then use the download link on that page; if it
+persists, the IP is likely rate-limited and it clears after a while. A saved
+`Access denied` is 13 bytes, and the CSV reader now names it as an error page
+rather than complaining about missing columns.
+
 The direct download URL is `https://stooq.com/q/d/l/?s=spy.us&i=d`, which is
 convenient with `curl` or a browser but is the same endpoint the `stooq`
 provider uses, so it is blocked wherever the provider is. Stooq rate-limits by

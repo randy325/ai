@@ -57,6 +57,38 @@ def parse_timestamp(raw: str) -> datetime:
         raise ValueError(f"unrecognized timestamp format: {raw!r}") from exc
 
 
+#: Bodies a data provider returns instead of a CSV when it refuses the request.
+#: Saved to disk with a .csv extension they look like data files, and the
+#: column-detection error they used to produce ("missing required column(s)")
+#: sent people looking for a formatting problem that was not there.
+_ERROR_BODIES = (
+    ("access denied", "the provider refused the request"),
+    ("exceeded the daily hits limit", "the provider's per-IP rate limit was hit"),
+    ("no data", "the provider has no data for that symbol"),
+    ("<!doctype", "an HTML page was saved instead of a CSV"),
+    ("<html", "an HTML page was saved instead of a CSV"),
+    ("403 forbidden", "the request was rejected with HTTP 403"),
+    ("404 not found", "the request was rejected with HTTP 404"),
+)
+
+
+def diagnose_error_body(text: str) -> str | None:
+    """Explain a non-CSV body, or return None if it might be real data.
+
+    Providers answer a refused download with a short message or an HTML error
+    page, both of which happily save as ``something.csv``. Recognising them is
+    the difference between "your file is an error page, re-download it" and a
+    confusing complaint about missing columns.
+    """
+    head = text.strip()[:400].lower()
+    if not head:
+        return "the file is empty"
+    for marker, explanation in _ERROR_BODIES:
+        if head.startswith(marker) or marker in head[:80]:
+            return explanation
+    return None
+
+
 class DataFeed:
     """Base feed. Subclasses implement ``__iter__``."""
 
@@ -119,6 +151,16 @@ class CSVFeed(DataFeed):
 
     def __iter__(self) -> Iterator[Candle]:
         with self.path.open(newline="", encoding="utf-8-sig") as handle:
+            preview = handle.read(512)
+            problem = diagnose_error_body(preview)
+            if problem is not None:
+                raise ValueError(
+                    f"{self.path} is not market data: {problem}. "
+                    f"It begins {preview.strip()[:60]!r}. Re-download it — a browser "
+                    "session usually succeeds where a direct fetch is refused."
+                )
+            handle.seek(0)
+
             reader = csv.DictReader(handle)
             if not reader.fieldnames:
                 return
