@@ -298,6 +298,16 @@ class TestLiveCLI(unittest.TestCase):
             self.assertEqual(code, 0, argv[0])
             self.assertIn("measure nothing about the strategy", out, argv[0])
 
+    def test_paper_results_carry_the_mock_warning(self):
+        # A live mock session prints the most flattering numbers of the lot.
+        code, out, _ = self.run_cli(
+            ["paper", "--provider", "mock", "--symbol", "MOCK", "--interval", "1m",
+             "--strategy", "buy-and-hold", "--warmup", "20", "--max-bars", "3",
+             "--speed", "500000"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("measure nothing about the strategy", out)
+
     def test_real_provider_results_carry_no_mock_warning(self):
         with mock.patch.object(config_module, "build_provider", stub_stooq):
             code, out, _ = self.run_cli(

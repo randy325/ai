@@ -438,6 +438,7 @@ def cmd_paper(args: argparse.Namespace) -> int:
         print(f"Open position: {position.quantity:+,.6f} @ {position.average_price:,.4f}")
     if result is not None and result.trades:
         print(result.metrics.format_report(f"Live paper session: {config.symbol}"))
+    _warn_if_mock(config.provider)
     return 0
 
 
