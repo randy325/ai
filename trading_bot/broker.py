@@ -7,10 +7,24 @@ see ``docs/going-live.md`` for what a live adapter would have to add.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
-from .models import Candle, Fill, Order, OrderType, Position, Side, Trade
+from .instruments import EQUITY, InstrumentSpec
+from .models import (
+    Candle,
+    Fill,
+    Order,
+    OrderResult,
+    OrderStatus,
+    OrderType,
+    Position,
+    Side,
+    Trade,
+)
+
+logger = logging.getLogger("trading_bot.broker")
 
 
 @dataclass
@@ -48,6 +62,65 @@ class InsufficientFunds(Exception):
     """Raised when an order would overdraw the account beyond its leverage."""
 
 
+class ReconciliationError(Exception):
+    """Raised when the broker's books do not agree with themselves."""
+
+
+@dataclass
+class OrderGuard:
+    """Pre-trade sanity checks applied to every order.
+
+    These are the cheap checks that catch a strategy or a data feed having gone
+    wrong — a price spike from a bad tick, a sizing bug asking for the account
+    ten times over. They are deliberately independent of the risk manager: a
+    fat-finger check that shares state with the thing it is checking is not a
+    check.
+    """
+
+    #: Reject if the fill price is more than this fraction from the last trade.
+    max_price_deviation: float = 0.10
+    #: Reject if a single order's notional exceeds this fraction of equity.
+    max_order_fraction: float = 1.5
+    #: Reject an order that would open a position beyond this count.
+    max_open_positions: int = 5
+    enabled: bool = True
+
+    def check(
+        self, order: Order, price: float, candle: Candle, broker: "PaperBroker"
+    ) -> tuple[bool, str]:
+        if not self.enabled:
+            return True, ""
+
+        if price <= 0:
+            return False, f"non-positive price {price}"
+
+        last = broker.last_price(order.symbol)
+        if last and last > 0:
+            deviation = abs(price - last) / last
+            if deviation > self.max_price_deviation:
+                return False, (
+                    f"price {price:.4f} is {deviation:.1%} from last {last:.4f}, "
+                    f"limit {self.max_price_deviation:.0%}"
+                )
+
+        equity = broker.equity()
+        if equity > 0:
+            notional = order.quantity * price
+            if notional > equity * self.max_order_fraction:
+                return False, (
+                    f"order notional {notional:,.2f} exceeds "
+                    f"{self.max_order_fraction:.1f}x equity {equity:,.2f}"
+                )
+
+        position = broker.position(order.symbol)
+        if position.is_flat:
+            open_positions = sum(1 for p in broker.positions.values() if not p.is_flat)
+            if open_positions >= self.max_open_positions:
+                return False, f"already holding {open_positions} positions, limit {self.max_open_positions}"
+
+        return True, ""
+
+
 @dataclass
 class _OpenTrade:
     side: Side
@@ -72,20 +145,112 @@ class PaperBroker:
     slippage: SlippageModel = field(default_factory=SlippageModel)
     allow_short: bool = True
     max_leverage: float = 1.0
+    spec: InstrumentSpec = field(default_factory=lambda: EQUITY)
+    guard: OrderGuard = field(default_factory=OrderGuard)
 
     def __post_init__(self) -> None:
         if self.starting_cash <= 0:
             raise ValueError("starting_cash must be positive")
         if self.max_leverage < 1.0:
             raise ValueError("max_leverage must be at least 1.0")
+        if self.guard.enabled and self.guard.max_order_fraction < self.max_leverage:
+            # A guard tighter than the leverage the account is configured for
+            # rejects every order, which looks like a dead strategy rather than
+            # a misconfiguration. Raise it to match and say so.
+            self.guard = replace(self.guard, max_order_fraction=self.max_leverage)
+            logger.info(
+                "raised guard max_order_fraction to %.2f to match max_leverage",
+                self.max_leverage,
+            )
         self.cash: float = self.starting_cash
         self.positions: dict[str, Position] = {}
         self.fills: list[Fill] = []
         self.trades: list[Trade] = []
         self.total_commission: float = 0.0
         self.rejections: list[tuple[datetime, str]] = []
+        self.halted: bool = False
+        self.halt_reason: str = ""
         self._marks: dict[str, float] = {}
         self._open_trades: dict[str, _OpenTrade] = {}
+        self._results: dict[str, OrderResult] = {}
+
+    # -- kill switch ---------------------------------------------------------
+
+    def kill(self, reason: str, candle: Candle | None = None) -> list[OrderResult]:
+        """Stop trading immediately, flattening if a price is available.
+
+        After this the broker rejects every order, so a caller that keeps
+        submitting cannot quietly resume. There are no resting orders to cancel
+        in this simulator — fills are synchronous — so flattening is the whole
+        of it; a live adapter would cancel working orders here first.
+        """
+        results: list[OrderResult] = []
+        if candle is not None and not self.halted:
+            results = self.close_all(candle)
+        self.halted = True
+        self.halt_reason = reason
+        logger.error("KILL SWITCH: %s", reason)
+        return results
+
+    def resume(self) -> None:
+        """Clear a halt. Deliberately explicit — nothing auto-resumes."""
+        self.halted = False
+        self.halt_reason = ""
+
+    # -- reconciliation ------------------------------------------------------
+
+    def reconcile(self, tolerance: float = 1e-6) -> list[str]:
+        """Check the books against themselves and report any disagreement.
+
+        With no exchange to query, the authority is the fill ledger: positions
+        and cash are both derivable from it, so replaying the fills and
+        comparing against the running state catches accounting drift that would
+        otherwise surface as a position the bot does not know it has.
+
+        A live adapter would replace this with a query to the venue and treat
+        *that* as the authority — never local state.
+        """
+        problems: list[str] = []
+
+        expected_quantities: dict[str, float] = {}
+        expected_cash = self.starting_cash
+        for fill in self.fills:
+            expected_quantities[fill.symbol] = (
+                expected_quantities.get(fill.symbol, 0.0) + fill.side.sign * fill.quantity
+            )
+            expected_cash += fill.cash_delta
+
+        for symbol, expected in expected_quantities.items():
+            actual = self.position(symbol).quantity
+            if abs(actual - expected) > tolerance:
+                problems.append(
+                    f"{symbol}: position {actual:.8f} but fills imply {expected:.8f}"
+                )
+
+        for symbol, position in self.positions.items():
+            if symbol not in expected_quantities and not position.is_flat:
+                problems.append(f"{symbol}: holding {position.quantity:.8f} with no fills")
+
+        if abs(self.cash - expected_cash) > tolerance:
+            problems.append(f"cash {self.cash:.8f} but fills imply {expected_cash:.8f}")
+
+        equity = self.equity()
+        if abs(equity - (self.cash + self.market_value())) > tolerance:
+            problems.append("equity does not equal cash plus market value")
+
+        commission = sum(f.commission for f in self.fills)
+        if abs(commission - self.total_commission) > tolerance:
+            problems.append(
+                f"commission total {self.total_commission:.8f} but fills sum to {commission:.8f}"
+            )
+
+        return problems
+
+    def assert_reconciled(self, tolerance: float = 1e-6) -> None:
+        """Reconcile and raise if the books disagree."""
+        problems = self.reconcile(tolerance)
+        if problems:
+            raise ReconciliationError("; ".join(problems))
 
     # -- state ---------------------------------------------------------------
 
@@ -99,6 +264,10 @@ class PaperBroker:
     def mark_price(self, symbol: str, price: float) -> None:
         """Mark a symbol at an explicit price, e.g. a bar's open."""
         self._marks[symbol] = price
+
+    def last_price(self, symbol: str) -> float | None:
+        """The most recent mark, used by the pre-trade price sanity check."""
+        return self._marks.get(symbol)
 
     def market_value(self) -> float:
         return sum(
@@ -122,41 +291,78 @@ class PaperBroker:
 
     # -- execution -----------------------------------------------------------
 
+    def _reject(self, order: Order, candle: Candle, reason: str) -> OrderResult:
+        self.rejections.append((candle.timestamp, reason))
+        result = OrderResult(order, OrderStatus.REJECTED, reason=reason)
+        self._results[order.client_order_id] = result
+        # Rejections after a halt are the kill switch working as intended, so
+        # they log at debug; anything else is a real refusal worth surfacing.
+        logger.log(
+            logging.DEBUG if self.halted else logging.WARNING,
+            "order rejected: %s",
+            result.describe(),
+        )
+        return result
+
     def submit(
         self, order: Order, candle: Candle, reference_price: float | None = None
-    ) -> Fill | None:
-        """Execute ``order`` against ``candle``. Returns ``None`` if rejected.
+    ) -> OrderResult:
+        """Execute ``order`` against ``candle`` and report what happened.
+
+        Always returns an :class:`OrderResult`; check ``status`` rather than
+        assuming a fill. An order trimmed by buying power comes back
+        ``PARTIALLY_FILLED`` with the shortfall in ``unfilled_quantity``, which
+        the previous version silently reported as a complete fill.
 
         ``reference_price`` overrides the bar's close as the pre-slippage fill
         price, which is how the engine fills on the next bar's open.
         """
+        if self.halted:
+            return self._reject(order, candle, f"broker halted: {self.halt_reason}")
+
+        # Idempotency: a resubmitted client_order_id returns the original
+        # outcome instead of opening a second position. This is what makes a
+        # retry after an ambiguous failure safe.
+        previous = self._results.get(order.client_order_id)
+        if previous is not None:
+            logger.warning("duplicate submission of %s ignored", order.client_order_id)
+            return OrderResult(
+                order,
+                OrderStatus.DUPLICATE,
+                filled_quantity=previous.filled_quantity,
+                fill=previous.fill,
+                reason=f"already {previous.status.value}",
+            )
+
         if order.quantity <= 0:
-            return None
+            return self._reject(order, candle, "non-positive quantity")
 
         reference = candle.close if reference_price is None else reference_price
         if order.type is OrderType.LIMIT:
             # A limit order only fills if the bar traded through its price.
             if order.side is Side.BUY and candle.low > order.limit_price:
-                self.rejections.append((candle.timestamp, "buy limit not reached"))
-                return None
+                return self._reject(order, candle, "buy limit not reached")
             if order.side is Side.SELL and candle.high < order.limit_price:
-                self.rejections.append((candle.timestamp, "sell limit not reached"))
-                return None
+                return self._reject(order, candle, "sell limit not reached")
             reference = order.limit_price
 
-        price = self.slippage.fill_price(order.side, reference, candle)
+        price = float(self.spec.round_price(self.slippage.fill_price(order.side, reference, candle)))
         position = self.position(order.symbol)
 
         if not self.allow_short:
             resulting = position.quantity + order.side.sign * order.quantity
             if resulting < -1e-9:
-                self.rejections.append((candle.timestamp, "shorting disabled"))
-                return None
+                return self._reject(order, candle, "shorting disabled")
 
-        quantity = self._affordable_quantity(order, position, price, candle)
-        if quantity <= 1e-9:
-            self.rejections.append((candle.timestamp, "insufficient buying power"))
-            return None
+        allowed, guard_reason = self.guard.check(order, price, candle, self)
+        if not allowed:
+            return self._reject(order, candle, guard_reason)
+
+        affordable = self._affordable_quantity(order, position, price, candle)
+        quantity = float(self.spec.round_quantity(affordable))
+        tradable, spec_reason = self.spec.is_tradable(quantity, price)
+        if not tradable:
+            return self._reject(order, candle, spec_reason)
 
         commission = self.commission.charge(quantity, price)
         fill = Fill(
@@ -167,6 +373,7 @@ class PaperBroker:
             price=price,
             commission=commission,
             reason=order.reason,
+            client_order_id=order.client_order_id,
         )
 
         self.cash += fill.cash_delta
@@ -174,7 +381,24 @@ class PaperBroker:
         self.fills.append(fill)
         position.apply(order.side, quantity, price)
         self._record_trade(fill, position)
-        return fill
+
+        # Partial means "less than the venue could have filled", so compare
+        # against the lot-rounded request. Rounding 10.7 down to a 1-share lot
+        # is quantisation, not a shortfall: no venue would ever fill the 0.7.
+        requested = float(self.spec.round_quantity(order.quantity))
+        shortfall = requested - quantity
+        partial = shortfall > float(self.spec.lot_size) / 2
+        result = OrderResult(
+            order,
+            OrderStatus.PARTIALLY_FILLED if partial else OrderStatus.FILLED,
+            filled_quantity=quantity,
+            fill=fill,
+            reason=f"{shortfall:.8f} unfilled" if partial else "",
+        )
+        self._results[order.client_order_id] = result
+        if partial:
+            logger.warning("partial fill: %s", result.describe())
+        return result
 
     def _affordable_quantity(
         self, order: Order, position: Position, price: float, candle: Candle
@@ -273,9 +497,9 @@ class PaperBroker:
         else:
             del self._open_trades[fill.symbol]
 
-    def close_all(self, candle: Candle, reference_price: float | None = None) -> list[Fill]:
+    def close_all(self, candle: Candle, reference_price: float | None = None) -> list[OrderResult]:
         """Flatten every open position at the given bar."""
-        fills = []
+        results = []
         for symbol, position in list(self.positions.items()):
             if position.is_flat:
                 continue
@@ -286,7 +510,8 @@ class PaperBroker:
                 quantity=abs(position.quantity),
                 reason="close-all",
             )
-            fill = self.submit(order, candle, reference_price)
-            if fill is not None:
-                fills.append(fill)
-        return fills
+            result = self.submit(order, candle, reference_price)
+            results.append(result)
+            if not result.filled:
+                logger.error("could not flatten %s: %s", symbol, result.reason)
+        return results

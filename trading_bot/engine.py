@@ -14,7 +14,17 @@ from typing import Callable, Iterable
 
 from .broker import PaperBroker
 from .metrics import Metrics, compute_metrics
-from .models import Candle, EquityPoint, Fill, Order, Side, Signal, Trade
+from .models import (
+    Candle,
+    EquityPoint,
+    Fill,
+    Order,
+    OrderResult,
+    OrderStatus,
+    Side,
+    Signal,
+    Trade,
+)
 from .risk import RiskManager
 from .strategy import Strategy
 
@@ -63,6 +73,10 @@ class TradingEngine:
         min_rebalance_fraction: float = MIN_REBALANCE_FRACTION,
         on_fill: Callable[[Fill], None] | None = None,
         on_bar: Callable[[Candle, Signal, float], None] | None = None,
+        on_order: Callable[[OrderResult], None] | None = None,
+        reconcile_every: int = 0,
+        max_consecutive_rejections: int = 5,
+        audit=None,
     ) -> None:
         if execute_on not in {"next_open", "close"}:
             raise ValueError("execute_on must be 'next_open' or 'close'")
@@ -79,7 +93,20 @@ class TradingEngine:
         self.min_rebalance_fraction = min_rebalance_fraction
         self.on_fill = on_fill
         self.on_bar = on_bar
+        self.on_order = on_order
+        #: Reconcile the books every N bars; 0 checks only at start and end.
+        self.reconcile_every = reconcile_every
+        #: Trip the kill switch after this many rejections in a row. A venue
+        #: refusing everything means something is wrong with us, the account or
+        #: the venue; retrying once a bar forever is how a bot spends a day
+        #: hammering an endpoint that was never going to say yes. 0 disables.
+        self.max_consecutive_rejections = max_consecutive_rejections
+        self._consecutive_rejections = 0
+        #: Optional AuditLogger; every order, fill, error and equity change
+        #: goes through it when set, independent of the console output.
+        self.audit = audit
         self.equity_curve: list[EquityPoint] = []
+        self.reconciliation_problems: list[str] = []
 
     def _rebalance_order(
         self, symbol: str, target_notional: float, price: float, reason: str
@@ -119,6 +146,16 @@ class TradingEngine:
         warnings: list[str] = []
         symbol = ""
 
+        # Never trust local state blindly: check the books before starting, so
+        # a run does not begin on top of an inconsistency inherited from a
+        # previous session or a partially applied recovery.
+        self.reconciliation_problems = self.broker.reconcile()
+        if self.audit:
+            self.audit.reconciliation(self.reconciliation_problems, phase="startup")
+        if self.reconciliation_problems:
+            warnings.extend(f"startup reconciliation: {p}" for p in self.reconciliation_problems)
+            logger.error("startup reconciliation failed: %s", "; ".join(self.reconciliation_problems))
+
         for candle in feed:
             bars += 1
             symbol = symbol or candle.symbol
@@ -127,7 +164,37 @@ class TradingEngine:
                 # Fill last bar's decision at this bar's open.
                 self.broker.mark_price(candle.symbol, candle.open)
                 closed_before = len(self.broker.trades)
-                fill = self.broker.submit(pending, candle, reference_price=candle.open)
+                if self.audit:
+                    self.audit.order_submitted(pending)
+                result = self.broker.submit(pending, candle, reference_price=candle.open)
+                if self.audit:
+                    self.audit.order_result(result)
+                fill = result.fill
+                if result.status is OrderStatus.PARTIALLY_FILLED:
+                    # Surfaced, not swallowed: the position is smaller than the
+                    # strategy asked for and the next rebalance must see that.
+                    warnings.append(
+                        f"partial fill on {candle.timestamp:%Y-%m-%d}: "
+                        f"{result.unfilled_quantity:.6f} of {result.requested_quantity:.6f} unfilled"
+                    )
+                elif result.status is OrderStatus.REJECTED:
+                    warnings.append(f"order rejected on {candle.timestamp:%Y-%m-%d}: {result.reason}")
+                    self._consecutive_rejections += 1
+                    if (
+                        self.max_consecutive_rejections
+                        and self._consecutive_rejections >= self.max_consecutive_rejections
+                        and not self.broker.halted
+                    ):
+                        reason = (
+                            f"{self._consecutive_rejections} consecutive rejections; "
+                            f"last: {result.reason}"
+                        )
+                        if self.audit:
+                            self.audit.kill_switch(reason, bar=bars)
+                        self.broker.kill(reason, candle)
+                        warnings.append(f"circuit breaker: {reason}")
+                if result.filled:
+                    self._consecutive_rejections = 0
                 if fill is not None:
                     self.risk.record_trade()
                     # An adaptive risk layer needs the result of each round
@@ -144,14 +211,20 @@ class TradingEngine:
                         fill.price,
                         fill.reason,
                     )
+                    if self.audit:
+                        self.audit.fill(fill)
                     if self.on_fill:
                         self.on_fill(fill)
+                if self.on_order:
+                    self.on_order(result)
                 pending = None
 
             self.broker.mark(candle)
             equity = self.broker.equity()
 
             if equity <= 0:
+                if self.audit:
+                    self.audit.error("account wiped out", timestamp=candle.timestamp)
                 warnings.append(f"account wiped out on {candle.timestamp:%Y-%m-%d}")
                 self.equity_curve.append(
                     EquityPoint(candle.timestamp, self.broker.cash, equity, 0.0)
@@ -160,6 +233,8 @@ class TradingEngine:
                 break
 
             self.risk.observe(candle, equity)
+            if self.audit:
+                self.audit.equity(candle.timestamp, equity, self.broker.cash, self.broker.exposure())
             signal = self.strategy.on_candle(candle)
 
             if bars <= self.warmup_bars:
@@ -187,11 +262,17 @@ class TradingEngine:
 
             if order is not None:
                 if self.execute_on == "close":
-                    fill = self.broker.submit(order, candle)
-                    if fill is not None:
+                    closed_before = len(self.broker.trades)
+                    result = self.broker.submit(order, candle)
+                    if result.fill is not None:
                         self.risk.record_trade()
+                        if hasattr(self.risk, "record_result"):
+                            for trade in self.broker.trades[closed_before:]:
+                                self.risk.record_result(trade.pnl)
                         if self.on_fill:
-                            self.on_fill(fill)
+                            self.on_fill(result.fill)
+                    if self.on_order:
+                        self.on_order(result)
                 else:
                     pending = order
 
@@ -207,13 +288,28 @@ class TradingEngine:
             if self.on_bar:
                 self.on_bar(candle, signal, self.broker.equity())
 
+            if self.reconcile_every and bars % self.reconcile_every == 0:
+                problems = self.broker.reconcile()
+                if self.audit:
+                    self.audit.reconciliation(problems, phase="periodic", bar=bars)
+                if problems:
+                    # Books disagreeing mid-run means the position is unknown.
+                    # Stop rather than keep trading against a bad picture.
+                    reason = f"reconciliation failed: {'; '.join(problems)}"
+                    if self.audit:
+                        self.audit.kill_switch(reason, bar=bars)
+                    self.broker.kill(reason, candle)
+                    warnings.extend(f"reconciliation: {p}" for p in problems)
+                    last_candle = candle
+                    break
+
             last_candle = candle
 
         if pending is not None:
             warnings.append("final bar's order was never filled (no subsequent bar)")
 
         if self.close_at_end and last_candle is not None:
-            fills = self.broker.close_all(last_candle)
+            fills = [r for r in self.broker.close_all(last_candle) if r.filled]
             if fills and self.equity_curve:
                 self.equity_curve[-1] = EquityPoint(
                     timestamp=last_candle.timestamp,
@@ -221,6 +317,15 @@ class TradingEngine:
                     equity=self.broker.equity(),
                     exposure=self.broker.exposure(),
                 )
+
+        # Final check: whatever the run did, the books must still add up.
+        closing_problems = self.broker.reconcile()
+        if self.audit:
+            self.audit.reconciliation(closing_problems, phase="final")
+        if closing_problems:
+            self.reconciliation_problems.extend(closing_problems)
+            warnings.extend(f"final reconciliation: {p}" for p in closing_problems)
+            logger.error("final reconciliation failed: %s", "; ".join(closing_problems))
 
         metrics = compute_metrics(
             self.equity_curve, self.broker.trades, self.broker.total_commission

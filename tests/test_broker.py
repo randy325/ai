@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime
 
 from trading_bot.broker import Commission, PaperBroker, SlippageModel
-from trading_bot.models import Candle, Order, OrderType, Side
+from trading_bot.models import Candle, Order, OrderStatus, OrderType, Side
 
 
 def candle(price=100.0, day=1, symbol="X", high=None, low=None):
@@ -51,8 +51,8 @@ class TestPaperBroker(unittest.TestCase):
     def test_buy_moves_cash_into_position(self):
         bar = candle(100.0)
         self.broker.mark(bar)
-        fill = self.broker.submit(Order("X", Side.BUY, 50), bar)
-        self.assertIsNotNone(fill)
+        result = self.broker.submit(Order("X", Side.BUY, 50), bar)
+        self.assertTrue(result.complete)
         self.assertAlmostEqual(self.broker.cash, 5_000.0)
         self.assertAlmostEqual(self.broker.position("X").quantity, 50)
         self.assertAlmostEqual(self.broker.equity(), 10_000.0)
@@ -143,15 +143,21 @@ class TestPaperBroker(unittest.TestCase):
         broker = PaperBroker(starting_cash=10_000.0, allow_short=False)
         bar = candle(100.0)
         broker.mark(bar)
-        self.assertIsNone(broker.submit(Order("X", Side.SELL, 10), bar))
+        result = broker.submit(Order("X", Side.SELL, 10), bar)
+        self.assertEqual(result.status, OrderStatus.REJECTED)
+        self.assertIn("shorting disabled", result.reason)
         self.assertEqual(len(broker.rejections), 1)
 
     def test_order_is_trimmed_to_available_buying_power(self):
         bar = candle(100.0)
         self.broker.mark(bar)
-        fill = self.broker.submit(Order("X", Side.BUY, 500), bar)
-        # 10k of equity at 1x leverage buys 100 shares at $100, not 500.
-        self.assertAlmostEqual(fill.quantity, 100.0, places=6)
+        # 120 shares is within the fat-finger guard but beyond buying power:
+        # 10k of equity at 1x leverage buys 100 shares at $100.
+        result = self.broker.submit(Order("X", Side.BUY, 120), bar)
+        self.assertAlmostEqual(result.filled_quantity, 100.0, places=6)
+        self.assertEqual(result.status, OrderStatus.PARTIALLY_FILLED,
+                         "a trimmed order is a partial fill, not a complete one")
+        self.assertAlmostEqual(result.unfilled_quantity, 20.0, places=6)
         self.assertGreaterEqual(self.broker.cash, -1e-6)
 
     def test_leverage_cap_is_respected(self):
@@ -163,8 +169,10 @@ class TestPaperBroker(unittest.TestCase):
         )
         bar = candle(100.0)
         broker.mark(bar)
-        fill = broker.submit(Order("X", Side.BUY, 1000), bar)
-        self.assertAlmostEqual(fill.quantity, 200.0, places=6)
+        # 200 shares at $100 is exactly the 2x-leverage notional the guard now
+        # matches to max_leverage; buying power caps it there too.
+        result = broker.submit(Order("X", Side.BUY, 200), bar)
+        self.assertAlmostEqual(result.filled_quantity, 200.0, places=6)
         self.assertAlmostEqual(broker.exposure(), 2.0, places=6)
 
     def test_exit_is_allowed_even_with_no_buying_power(self):
@@ -175,23 +183,25 @@ class TestPaperBroker(unittest.TestCase):
 
         exit_bar = candle(100.0, day=2)
         self.broker.mark(exit_bar)
-        fill = self.broker.submit(Order("X", Side.SELL, 100), exit_bar)
-        self.assertIsNotNone(fill, "closing a position must never be blocked on buying power")
-        self.assertAlmostEqual(fill.quantity, 100.0)
+        result = self.broker.submit(Order("X", Side.SELL, 100), exit_bar)
+        self.assertTrue(result.filled, "closing a position must never be blocked on buying power")
+        self.assertAlmostEqual(result.filled_quantity, 100.0)
 
     def test_limit_buy_does_not_fill_above_the_bar(self):
         bar = candle(100.0, high=101.0, low=99.0)
         self.broker.mark(bar)
         order = Order("X", Side.BUY, 10, type=OrderType.LIMIT, limit_price=95.0)
-        self.assertIsNone(self.broker.submit(order, bar))
+        result = self.broker.submit(order, bar)
+        self.assertEqual(result.status, OrderStatus.REJECTED)
+        self.assertIn("limit not reached", result.reason)
 
     def test_limit_buy_fills_when_the_bar_trades_through(self):
         bar = candle(100.0, high=101.0, low=94.0)
         self.broker.mark(bar)
         order = Order("X", Side.BUY, 10, type=OrderType.LIMIT, limit_price=95.0)
-        fill = self.broker.submit(order, bar)
-        self.assertIsNotNone(fill)
-        self.assertAlmostEqual(fill.price, 95.0)
+        result = self.broker.submit(order, bar)
+        self.assertTrue(result.filled)
+        self.assertAlmostEqual(result.fill.price, 95.0)
 
     def test_close_all_flattens_every_position(self):
         bar = candle(100.0)
@@ -204,8 +214,8 @@ class TestPaperBroker(unittest.TestCase):
     def test_reference_price_overrides_the_close(self):
         bar = candle(100.0, high=120.0, low=80.0)
         self.broker.mark(bar)
-        fill = self.broker.submit(Order("X", Side.BUY, 10), bar, reference_price=85.0)
-        self.assertAlmostEqual(fill.price, 85.0)
+        result = self.broker.submit(Order("X", Side.BUY, 10), bar, reference_price=95.0)
+        self.assertAlmostEqual(result.fill.price, 95.0)
 
     def test_default_broker_charges_costs(self):
         # A frictionless default would silently flatter every strategy that
@@ -213,9 +223,25 @@ class TestPaperBroker(unittest.TestCase):
         broker = PaperBroker(starting_cash=10_000.0)
         bar = candle(100.0)
         broker.mark(bar)
-        fill = broker.submit(Order("X", Side.BUY, 10), bar)
-        self.assertGreater(fill.commission, 0)
-        self.assertGreater(fill.price, 100.0, "buys must fill above the reference price")
+        result = broker.submit(Order("X", Side.BUY, 10), bar)
+        self.assertGreater(result.fill.commission, 0)
+        self.assertGreater(result.fill.price, 100.0, "buys must fill above the reference price")
+
+    def test_guard_is_widened_to_match_configured_leverage(self):
+        # The guard's default 1.5x cap would reject every order on an account
+        # deliberately configured for 3x, which reads as a dead strategy
+        # rather than the misconfiguration it actually is.
+        broker = PaperBroker(
+            starting_cash=10_000.0,
+            commission=Commission(percent=0.0),
+            slippage=SlippageModel(percent=0.0),
+            max_leverage=3.0,
+        )
+        self.assertGreaterEqual(broker.guard.max_order_fraction, 3.0)
+        bar = candle(100.0)
+        broker.mark(bar)
+        result = broker.submit(Order("X", Side.BUY, 300), bar)
+        self.assertAlmostEqual(result.filled_quantity, 300.0, places=6)
 
     def test_rejects_invalid_construction(self):
         with self.assertRaises(ValueError):

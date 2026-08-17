@@ -23,7 +23,10 @@ from pathlib import Path
 from .config import RunConfig
 from .data import SyntheticFeed, write_csv
 from .engine import BacktestResult
+from .instruments import SPECS
+from .models import Order, OrderStatus, Side
 from .providers import INTERVAL_SECONDS, PROVIDERS, DataFeedError, build_provider
+from .risk import TieredRiskManager
 from .strategy import STRATEGIES
 
 
@@ -52,6 +55,8 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     account.add_argument("--cash", type=float, default=100_000.0, help="starting cash")
     account.add_argument("--commission", type=float, default=0.001, help="commission as a fraction of notional")
     account.add_argument("--slippage", type=float, default=0.0005, help="slippage as a fraction of price")
+    account.add_argument("--spread-fraction", type=float, default=0.0,
+                         help="bid-ask spread as a fraction of each bar's high-low range")
     account.add_argument("--leverage", type=float, default=1.0, help="maximum gross leverage")
 
     risk = parser.add_argument_group("risk")
@@ -62,6 +67,18 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     risk.add_argument("--max-drawdown", type=float, default=0.25, help="halt trading past this drawdown; 0 disables")
     risk.add_argument("--daily-loss-limit", type=float, default=None, help="pause for the day past this loss")
     risk.add_argument("--max-trades-per-day", type=int, default=None)
+
+    guard = parser.add_argument_group("pre-trade sanity checks")
+    guard.add_argument("--instrument", choices=sorted(SPECS), default="equity",
+                       help="tick/lot size and minimums to round and validate orders against")
+    guard.add_argument("--max-price-deviation", type=float, default=0.10,
+                       help="reject a fill more than this fraction from the last price")
+    guard.add_argument("--max-order-fraction", type=float, default=1.5,
+                       help="reject a single order above this multiple of equity")
+    guard.add_argument("--max-open-positions", type=int, default=5,
+                       help="reject a new position beyond this many held at once")
+    guard.add_argument("--no-guard", action="store_true",
+                       help="disable pre-trade sanity checks (not recommended)")
 
     behaviour = parser.add_argument_group("behaviour")
     behaviour.add_argument("--allow-short", action="store_true", help="permit short positions")
@@ -75,6 +92,8 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     behaviour.add_argument("--config", help="JSON config file; CLI flags override its values")
     behaviour.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
                            help="strategy parameter, repeatable (e.g. --param fast=10)")
+    behaviour.add_argument("--log-file", metavar="PATH",
+                           help="write structured JSON-lines audit log of every order/fill/error")
 
 
 def _coerce(value: str):
@@ -148,6 +167,7 @@ def _config_from_args(args: argparse.Namespace, strategy: str | None = None) -> 
     take("cash", args.cash, "starting_cash")
     take("commission", args.commission, "commission_percent")
     take("slippage", args.slippage, "slippage_percent")
+    take("spread_fraction", args.spread_fraction)
     take("leverage", args.leverage, "max_leverage")
     take("sizer", args.sizer)
     take("position_fraction", args.position_fraction)
@@ -158,6 +178,14 @@ def _config_from_args(args: argparse.Namespace, strategy: str | None = None) -> 
     take("allow_short", args.allow_short)
     take("trend_filter", args.trend_filter)
     take("execute_on", args.execute_on)
+    take("instrument", args.instrument)
+    take("max_price_deviation", args.max_price_deviation)
+    take("max_order_fraction", args.max_order_fraction)
+    take("max_open_positions", args.max_open_positions)
+    if args.no_guard:
+        config.guard_enabled = False
+    take("mode", getattr(args, "mode", "paper"))
+    take("log_file", getattr(args, "log_file", None))
 
     if "max_drawdown" in provided or not getattr(args, "config", None):
         config.max_drawdown = args.max_drawdown if args.max_drawdown else None
@@ -382,9 +410,38 @@ def cmd_providers(args: argparse.Namespace) -> int:
     return 0
 
 
+LIVE_CONFIRM_PHRASE = "I UNDERSTAND THIS IS NOT REAL"
+
+
 def cmd_paper(args: argparse.Namespace) -> int:
     """Paper-trade live bars as they close. Places no real orders."""
+    if args.mode == "live":
+        # Gate this before touching any config or network: a mistyped or
+        # missing confirmation must never fall through to trading, paper or
+        # otherwise. There is no broker adapter behind this — see
+        # docs/going-live.md — so live mode always ends in refusal, but the
+        # confirmation requirement is enforced regardless, since the check
+        # needs to exist for the day an adapter is added.
+        if args.live_confirm != LIVE_CONFIRM_PHRASE:
+            print(
+                f"error: --mode live requires --live-confirm '{LIVE_CONFIRM_PHRASE}'\n"
+                "This package has no exchange adapter: no authenticated client, no "
+                "signed requests, no reconciliation against a real venue. There is no "
+                "code path here that can place a real order, live confirmation or not. "
+                "See docs/going-live.md for what that would require.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            "error: live confirmation accepted, but mode='live' is refused anyway: "
+            "this package has no broker adapter and cannot place real orders. "
+            "See docs/going-live.md.",
+            file=sys.stderr,
+        )
+        return 2
+
     config = _config_from_args(args)
+    config.mode = "paper"
     if not config.provider:
         print("error: paper trading needs --provider", file=sys.stderr)
         return 2
@@ -402,6 +459,7 @@ def cmd_paper(args: argparse.Namespace) -> int:
         f"Strategy: {engine.strategy.describe()}\n"
         f"Starting cash: ${config.starting_cash:,.2f}   "
         f"{'Bars: ' + str(args.max_bars) if args.max_bars else 'Running until interrupted'}\n"
+        f"{'Audit log: ' + config.log_file if config.log_file else 'No audit log configured'}\n"
         "No real orders are placed. Press Ctrl-C to stop.\n"
     )
 
@@ -422,23 +480,53 @@ def cmd_paper(args: argparse.Namespace) -> int:
         )
 
     engine.on_bar = on_bar
-    engine.on_fill = lambda fill: print(
-        f"  -> {fill.side.value.upper()} {fill.quantity:,.6f} @ {fill.price:,.4f} "
-        f"(fee {fill.commission:,.2f})"
-    )
 
+    def report_fill(fill):
+        print(f"  -> {fill.side.value.upper()} {fill.quantity:,.6f} @ {fill.price:,.4f} "
+              f"(fee {fill.commission:,.2f})")
+
+    def report_order(order_result):
+        if order_result.status.value in ("rejected", "partially_filled"):
+            print(f"  !! {order_result.describe()}")
+
+    engine.on_fill = report_fill
+    engine.on_order = report_order
+
+    result = None
     try:
         result = engine.run(feed)
     except KeyboardInterrupt:
         print("\nInterrupted.")
-        result = None
     except DataFeedError as exc:
         print(f"\nfeed stopped: {exc}", file=sys.stderr)
-        result = None
+        if engine.audit:
+            engine.audit.error(f"feed stopped: {exc}")
+    except Exception as exc:  # noqa: BLE001 - top-level boundary: never exit
+        # without reconciling. A bug here must not leave a live session's
+        # position state unknown; log, reconcile, and surface it rather than
+        # letting the traceback be the only record.
+        print(f"\nunexpected error: {exc}", file=sys.stderr)
+        if engine.audit:
+            engine.audit.error(f"unexpected error: {exc}", exception=type(exc).__name__)
+        logger.exception("unhandled error in paper session")
 
     broker = engine.broker
+    problems = broker.reconcile()
+    if problems:
+        print("\n!! RECONCILIATION FAILED — local state does not agree with itself:")
+        for problem in problems:
+            print(f"   - {problem}")
+        if engine.audit:
+            engine.audit.reconciliation(problems, phase="cli-exit")
+
     print(f"\nFinal equity ${broker.equity():,.2f} "
           f"({broker.equity() / config.starting_cash - 1:+.2%})")
+    if broker.halted:
+        print(f"Broker halted: {broker.halt_reason}")
+    if isinstance(engine.risk, TieredRiskManager) and engine.risk.tier_changes:
+        print(f"Risk tier: {engine.risk.tier.name} "
+              f"(changes: {' -> '.join([engine.risk.tier_changes[0][0]] + [t[1] for t in engine.risk.tier_changes])})")
+
     position = broker.position(config.symbol)
     open_position = ""
     if not position.is_flat:
@@ -455,7 +543,66 @@ def cmd_paper(args: argparse.Namespace) -> int:
             result.metrics.extras["open_position"] = open_position
         print(result.metrics.format_report(f"Live paper session: {config.symbol}"))
     _warn_if_mock(config.provider)
-    return 0
+    return 1 if problems else 0
+
+
+def cmd_kill(args: argparse.Namespace) -> int:
+    """Trip the kill switch mid-run and prove it flattens and stays stopped."""
+    config = RunConfig(
+        strategy=args.strategy, provider=args.provider, symbol=args.symbol,
+        interval="1d", limit=args.bars, cache_dir=None, starting_cash=10_000.0,
+    )
+    engine = config.build_engine()
+    broker = engine.broker
+    candles = list(config.build_feed())
+    if not candles:
+        print("error: no data", file=sys.stderr)
+        return 2
+
+    fired: dict = {}
+
+    def on_bar(candle, signal, equity):
+        index = len(engine.equity_curve)
+        if index == args.at_bar and not broker.halted:
+            position_before = broker.position(candle.symbol).quantity
+            results = broker.kill("operator kill switch", candle)
+            fired.update(
+                bar=index, timestamp=candle.timestamp,
+                position_before=position_before,
+                flattened=[r.describe() for r in results],
+                position_after=broker.position(candle.symbol).quantity,
+            )
+
+    engine.on_bar = on_bar
+    engine.run(candles)
+
+    if not fired:
+        print(f"kill switch never fired (only {len(engine.equity_curve)} bars ran)", file=sys.stderr)
+        return 1
+
+    print(f"Kill switch fired on bar {fired['bar']} at {fired['timestamp']:%Y-%m-%d}")
+    print(f"  position before : {fired['position_before']:+,.6f}")
+    for line in fired["flattened"]:
+        print(f"  flattening      : {line}")
+    print(f"  position after  : {fired['position_after']:+,.6f}")
+    print(f"  broker halted   : {broker.halted} ({broker.halt_reason})")
+
+    # A halted broker must refuse everything afterwards, or "stopped" is a
+    # suggestion rather than a guarantee.
+    probe = broker.submit(Order(args.symbol.upper(), Side.BUY, 1.0), candles[-1])
+    print(f"  post-kill order : {probe.status.value} ({probe.reason})")
+
+    problems = broker.reconcile()
+    print(f"  reconciliation  : {'clean' if not problems else '; '.join(problems)}")
+
+    ok = (
+        abs(fired["position_after"]) < 1e-9
+        and broker.halted
+        and probe.status is OrderStatus.REJECTED
+        and not problems
+    )
+    print(f"\n{'PASS' if ok else 'FAIL'}: kill switch flattens, halts, and refuses new orders")
+    return 0 if ok else 1
 
 
 def cmd_strategies(args: argparse.Namespace) -> int:
@@ -536,8 +683,23 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument("--speed", type=float, default=1.0,
                        help="compress time by this factor (mock provider only): "
                             "--speed 60 gives a 1m bar every real second")
+    paper.add_argument("--mode", choices=["paper", "live"], default="paper",
+                       help="'live' requires --live-confirm and will still refuse: "
+                            "no broker adapter exists in this package")
+    paper.add_argument("--live-confirm", metavar="PHRASE",
+                       help="required with --mode live: must equal I UNDERSTAND THIS IS NOT REAL")
     _add_common_arguments(paper)
     paper.set_defaults(func=cmd_paper)
+
+    kill = subparsers.add_parser(
+        "kill", help="cancel-all-and-stop: verifies a running bot's kill switch fires cleanly"
+    )
+    kill.add_argument("--provider", default="mock", choices=sorted(PROVIDERS))
+    kill.add_argument("--symbol", default="MOCK")
+    kill.add_argument("--strategy", default="buy-and-hold", choices=sorted(STRATEGIES))
+    kill.add_argument("--bars", type=int, default=60)
+    kill.add_argument("--at-bar", type=int, default=10, help="bar index to trigger the kill on")
+    kill.set_defaults(func=cmd_kill)
 
     return parser
 

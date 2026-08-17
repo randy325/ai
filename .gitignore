@@ -1,3 +1,10 @@
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -15,3 +22,7 @@ data/
 !tests/**/*.csv
 equity.csv
 trades.csv
+
+# Audit logs may contain position and P&L detail
+logs/
+*.jsonl

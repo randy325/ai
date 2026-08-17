@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -22,6 +23,20 @@ class Side(str, Enum):
 class OrderType(str, Enum):
     MARKET = "market"
     LIMIT = "limit"
+
+
+class OrderStatus(str, Enum):
+    """Terminal state of a submitted order."""
+
+    FILLED = "filled"
+    PARTIALLY_FILLED = "partially_filled"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    DUPLICATE = "duplicate"
+
+    @property
+    def is_fill(self) -> bool:
+        return self in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)
 
 
 @dataclass(frozen=True)
@@ -57,18 +72,28 @@ class Candle:
 
 @dataclass(frozen=True)
 class Order:
+    """An order request.
+
+    ``client_order_id`` is assigned here rather than by the venue, so a retry
+    after an ambiguous failure carries the same identity as the original and
+    can be recognised as a duplicate instead of becoming a second position.
+    """
+
     symbol: str
     side: Side
     quantity: float
     type: OrderType = OrderType.MARKET
     limit_price: float | None = None
     reason: str = ""
+    client_order_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
 
     def __post_init__(self) -> None:
         if self.quantity <= 0:
             raise ValueError(f"order quantity must be positive, got {self.quantity}")
         if self.type is OrderType.LIMIT and self.limit_price is None:
             raise ValueError("limit orders require a limit_price")
+        if not self.client_order_id:
+            raise ValueError("client_order_id must not be empty")
 
 
 @dataclass(frozen=True)
@@ -80,6 +105,7 @@ class Fill:
     price: float
     commission: float
     reason: str = ""
+    client_order_id: str = ""
 
     @property
     def notional(self) -> float:
@@ -89,6 +115,49 @@ class Fill:
     def cash_delta(self) -> float:
         """Change in cash balance caused by this fill, commission included."""
         return -self.side.sign * self.notional - self.commission
+
+
+@dataclass(frozen=True)
+class OrderResult:
+    """What became of a submitted order.
+
+    Every submission returns one of these. A caller that ignores the status
+    cannot tell a full fill from a partial one, which is how a bot ends up
+    believing it holds a position it only partly has.
+    """
+
+    order: Order
+    status: OrderStatus
+    filled_quantity: float = 0.0
+    fill: Fill | None = None
+    reason: str = ""
+
+    @property
+    def requested_quantity(self) -> float:
+        return self.order.quantity
+
+    @property
+    def unfilled_quantity(self) -> float:
+        return max(self.order.quantity - self.filled_quantity, 0.0)
+
+    @property
+    def filled(self) -> bool:
+        return self.status.is_fill
+
+    @property
+    def complete(self) -> bool:
+        return self.status is OrderStatus.FILLED
+
+    def __bool__(self) -> bool:
+        return self.filled
+
+    def describe(self) -> str:
+        text = (
+            f"{self.order.client_order_id} {self.order.side.value} "
+            f"{self.filled_quantity:.8f}/{self.order.quantity:.8f} "
+            f"{self.order.symbol} {self.status.value}"
+        )
+        return f"{text} ({self.reason})" if self.reason else text
 
 
 @dataclass

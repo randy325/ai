@@ -7,9 +7,10 @@ from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
-from .broker import Commission, PaperBroker, SlippageModel
+from .broker import Commission, OrderGuard, PaperBroker, SlippageModel
 from .data import CSVFeed, DataFeed, SyntheticFeed
 from .engine import TradingEngine
+from .instruments import build_spec as build_instrument_spec
 from .providers import (
     FallbackProvider,
     LiveFeed,
@@ -58,6 +59,10 @@ class RunConfig:
     commission_per_share: float = 0.0
     commission_minimum: float = 0.0
     slippage_percent: float = 0.0005
+    #: Extra cost as a fraction of each bar's high-low range, modelling the
+    #: bid-ask spread. slippage_percent alone is a crude flat proxy; this makes
+    #: wide, volatile bars cost more to trade, which is what actually happens.
+    spread_fraction: float = 0.0
 
     sizer: str = "fixed"
     position_fraction: float = 0.95
@@ -79,6 +84,23 @@ class RunConfig:
     max_leverage: float = 1.0
     trend_filter: int | None = None
     execute_on: str = "next_open"
+
+    #: Preset name from trading_bot.instruments.SPECS: tick size, lot size and
+    #: minimums used to round and validate every order.
+    instrument: str = "equity"
+    #: Pre-trade sanity checks, independent of the risk manager.
+    guard_enabled: bool = True
+    max_price_deviation: float = 0.10
+    max_order_fraction: float = 1.5
+    max_open_positions: int = 5
+
+    #: JSONL audit log path. None disables structured logging.
+    log_file: str | None = None
+
+    #: "paper" never places a real order. "live" requires a broker adapter
+    #: this package does not have, so building one refuses with an explanation
+    #: rather than silently trading paper under a live label.
+    mode: str = "paper"
 
     @classmethod
     def from_file(cls, path: str | Path) -> "RunConfig":
@@ -143,6 +165,18 @@ class RunConfig:
         return strategy
 
     def build_broker(self) -> PaperBroker:
+        if self.mode not in {"paper", "live"}:
+            raise ValueError(f"unknown mode {self.mode!r}; expected 'paper' or 'live'")
+        if self.mode == "live":
+            # There is no exchange adapter in this package: no authenticated
+            # client, no signed requests, no order-state reconciliation against
+            # a real venue. Silently running paper trades under a "live" label
+            # would be worse than refusing, so this refuses. See
+            # docs/going-live.md for what a live adapter would need.
+            raise ValueError(
+                "mode='live' requires a broker adapter this package does not implement. "
+                "Nothing here can place a real order. See docs/going-live.md."
+            )
         return PaperBroker(
             starting_cash=self.starting_cash,
             commission=Commission(
@@ -150,10 +184,28 @@ class RunConfig:
                 percent=self.commission_percent,
                 minimum=self.commission_minimum,
             ),
-            slippage=SlippageModel(percent=self.slippage_percent),
+            slippage=SlippageModel(
+                percent=self.slippage_percent,
+                spread_fraction=self.spread_fraction,
+            ),
             allow_short=self.allow_short,
             max_leverage=self.max_leverage,
+            spec=build_instrument_spec(self.instrument),
+            guard=OrderGuard(
+                max_price_deviation=self.max_price_deviation,
+                max_order_fraction=self.max_order_fraction,
+                max_open_positions=self.max_open_positions,
+                enabled=self.guard_enabled,
+            ),
         )
+
+    def build_audit(self):
+        """The structured JSONL audit logger, or None if no log file is set."""
+        if not self.log_file:
+            return None
+        from .audit_log import configure_audit_log
+
+        return configure_audit_log(self.log_file)
 
     def build_sizer(self) -> PositionSizer:
         if self.sizer == "fixed":
@@ -232,4 +284,5 @@ class RunConfig:
             broker=self.build_broker(),
             risk=self.build_risk(),
             execute_on=self.execute_on,
+            audit=self.build_audit(),
         )
