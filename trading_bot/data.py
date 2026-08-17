@@ -23,10 +23,19 @@ _TIMESTAMP_FORMATS = (
     "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%d %H:%M",
     "%Y-%m-%d",
-    # Month-first first. Both orderings are guesses for a date like 03/04/2020,
-    # but day-first silently produced an interleaved sequence on US exports:
-    # day-first for days <= 12, month-first for >= 13. Preferring month-first
-    # at least fails consistently, and matches what Stooq and Yahoo emit.
+    # Slash dates, month-first before day-first. Both orderings are guesses for
+    # a date like 03/04/2020, but day-first silently produced an interleaved
+    # sequence on US exports: day-first for days <= 12, month-first for >= 13.
+    # Month-first at least fails consistently, and matches what Stooq, Yahoo
+    # and Google Sheets emit.
+    #
+    # The time-bearing variants are what GOOGLEFINANCE("TICKER","all",...)
+    # produces — "1/2/2024 16:00:00" — which parsed as nothing at all until a
+    # real export was about to be pasted in.
+    "%m/%d/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%d/%m/%Y %H:%M",
     "%m/%d/%Y",
     "%d/%m/%Y",
 )

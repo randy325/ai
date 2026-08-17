@@ -237,3 +237,46 @@ class TestErrorBodyDiagnosis(unittest.TestCase):
     def test_diagnosis_returns_none_for_plausible_data(self):
         from trading_bot.data import diagnose_error_body
         self.assertIsNone(diagnose_error_body("timestamp,close\n2020-01-01,100\n"))
+
+
+class TestSpreadsheetExportFormats(unittest.TestCase):
+    """A GOOGLEFINANCE export must parse without hand-editing.
+
+    ``=GOOGLEFINANCE("SPY","all",...)`` writes its dates as "1/2/2024 16:00:00",
+    which matched none of the accepted formats — the export would have been
+    rejected wholesale the first time anyone pasted one in.
+    """
+
+    def test_googlefinance_datetime_parses(self):
+        from trading_bot.data import parse_timestamp
+        self.assertEqual(parse_timestamp("1/2/2024 16:00:00"), datetime(2024, 1, 2, 16, 0))
+        self.assertEqual(parse_timestamp("01/02/2024 16:00:00"), datetime(2024, 1, 2, 16, 0))
+
+    def test_minute_precision_variant_parses(self):
+        from trading_bot.data import parse_timestamp
+        self.assertEqual(parse_timestamp("3/15/2024 09:30"), datetime(2024, 3, 15, 9, 30))
+
+    def test_month_first_still_wins_for_ambiguous_slash_dates(self):
+        from trading_bot.data import parse_timestamp
+        self.assertEqual(parse_timestamp("3/4/2024 16:00:00"), datetime(2024, 3, 4, 16, 0))
+
+    def test_an_unambiguous_day_first_datetime_still_parses(self):
+        from trading_bot.data import parse_timestamp
+        self.assertEqual(parse_timestamp("25/12/2024 16:00:00"), datetime(2024, 12, 25, 16, 0))
+
+    def test_a_full_googlefinance_export_loads(self):
+        import tempfile
+        from trading_bot.data import CSVFeed
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "spy.csv"
+            path.write_text(
+                "Date,Open,High,Low,Close,Volume\n"
+                "1/2/2024 16:00:00,472.16,473.67,470.49,472.65,123963000\n"
+                "1/3/2024 16:00:00,470.43,471.19,468.17,468.79,103800800\n"
+                "1/4/2024 16:00:00,468.3,470.96,467.05,467.28,84232200\n",
+                encoding="utf-8",
+            )
+            candles = list(CSVFeed(path))
+        self.assertEqual(len(candles), 3)
+        self.assertAlmostEqual(candles[0].close, 472.65)
+        self.assertAlmostEqual(candles[-1].volume, 84232200)

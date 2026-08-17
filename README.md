@@ -436,6 +436,17 @@ the evaluation at a directory instead.
 4. Save it as `data/manual/<symbol>.csv` — the filename becomes the instrument
    name, so `spy.us.csv` is better renamed `spy.csv`.
 
+**Google Sheets needs no download endpoint at all**, which sidesteps Stooq's
+session checks entirely:
+
+1. Open a blank sheet at `sheets.new`
+2. In A1: `=GOOGLEFINANCE("SPY","all",TODAY()-1095,TODAY(),"DAILY")`
+3. File → Download → Comma Separated Values
+4. Repeat for QQQ, XLU, TLT
+
+That export lands as `Date,Open,High,Low,Close,Volume` with dates like
+`1/2/2024 16:00:00`, all of which the reader takes unmodified.
+
 **If the download returns `Access denied`**, Stooq refused the request rather
 than the network failing. It rejects direct fetches that arrive without a
 browser session, and rate-limits by IP. Open the quote page in a browser first
