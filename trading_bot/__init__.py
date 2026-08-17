@@ -15,7 +15,20 @@ from .config import RunConfig
 from .data import CandleFeed, CSVFeed, DataFeed, SyntheticFeed
 from .engine import BacktestResult, TradingEngine
 from .metrics import Metrics, compute_metrics
-from .models import Candle, EquityPoint, Fill, Order, OrderType, Position, Side, Signal, Trade
+from .models import (
+    Candle,
+    EquityPoint,
+    Fill,
+    Order,
+    OrderResult,
+    OrderStatus,
+    OrderType,
+    Position,
+    RejectionKind,
+    Side,
+    Signal,
+    Trade,
+)
 from .providers import (
     PROVIDERS,
     BinanceProvider,
@@ -89,6 +102,8 @@ __all__ = [
     "MockProvider",
     "Metrics",
     "Order",
+    "OrderResult",
+    "OrderStatus",
     "OrderType",
     "PROVIDERS",
     "PaperBroker",
@@ -97,6 +112,7 @@ __all__ = [
     "RSIBreakout",
     "RSIMeanReversion",
     "RateLimited",
+    "RejectionKind",
     "RiskLimits",
     "RiskManager",
     "RiskTier",

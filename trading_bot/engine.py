@@ -179,7 +179,14 @@ class TradingEngine:
                     )
                 elif result.status is OrderStatus.REJECTED:
                     warnings.append(f"order rejected on {candle.timestamp:%Y-%m-%d}: {result.reason}")
-                    self._consecutive_rejections += 1
+                    # Only an external refusal counts. Our own risk layer saying
+                    # no is the system working: a long-only account declining
+                    # short signals, or a rebalance below the venue's minimum,
+                    # would otherwise halt a perfectly healthy bot within a few
+                    # bars.
+                    kind = result.rejection_kind
+                    if kind is not None and kind.counts_toward_breaker:
+                        self._consecutive_rejections += 1
                     if (
                         self.max_consecutive_rejections
                         and self._consecutive_rejections >= self.max_consecutive_rejections

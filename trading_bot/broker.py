@@ -20,6 +20,7 @@ from .models import (
     OrderStatus,
     OrderType,
     Position,
+    RejectionKind,
     Side,
     Trade,
 )
@@ -291,9 +292,17 @@ class PaperBroker:
 
     # -- execution -----------------------------------------------------------
 
-    def _reject(self, order: Order, candle: Candle, reason: str) -> OrderResult:
+    def _reject(
+        self,
+        order: Order,
+        candle: Candle,
+        reason: str,
+        kind: RejectionKind = RejectionKind.RISK,
+    ) -> OrderResult:
         self.rejections.append((candle.timestamp, reason))
-        result = OrderResult(order, OrderStatus.REJECTED, reason=reason)
+        result = OrderResult(
+            order, OrderStatus.REJECTED, reason=reason, rejection_kind=kind
+        )
         self._results[order.client_order_id] = result
         # Rejections after a halt are the kill switch working as intended, so
         # they log at debug; anything else is a real refusal worth surfacing.
@@ -318,7 +327,9 @@ class PaperBroker:
         price, which is how the engine fills on the next bar's open.
         """
         if self.halted:
-            return self._reject(order, candle, f"broker halted: {self.halt_reason}")
+            return self._reject(
+                order, candle, f"broker halted: {self.halt_reason}", RejectionKind.HALTED
+            )
 
         # Idempotency: a resubmitted client_order_id returns the original
         # outcome instead of opening a second position. This is what makes a
@@ -341,9 +352,13 @@ class PaperBroker:
         if order.type is OrderType.LIMIT:
             # A limit order only fills if the bar traded through its price.
             if order.side is Side.BUY and candle.low > order.limit_price:
-                return self._reject(order, candle, "buy limit not reached")
+                return self._reject(
+                    order, candle, "buy limit not reached", RejectionKind.MARKET
+                )
             if order.side is Side.SELL and candle.high < order.limit_price:
-                return self._reject(order, candle, "sell limit not reached")
+                return self._reject(
+                    order, candle, "sell limit not reached", RejectionKind.MARKET
+                )
             reference = order.limit_price
 
         price = float(self.spec.round_price(self.slippage.fill_price(order.side, reference, candle)))

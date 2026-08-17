@@ -25,6 +25,31 @@ class OrderType(str, Enum):
     LIMIT = "limit"
 
 
+class RejectionKind(str, Enum):
+    """Why an order was refused, and therefore who should react to it.
+
+    The distinction drives the circuit breaker. A venue refusing our orders
+    means something is wrong that waiting will not fix — bad credentials, a
+    restricted account, a halted symbol — so it should stop the bot. Our own
+    risk layer declining an order is the system working correctly, and must
+    never be mistaken for a fault: a long-only account refusing short signals
+    would otherwise halt itself after a handful of bars.
+    """
+
+    #: The counterparty refused. Counts toward the circuit breaker.
+    VENUE = "venue"
+    #: Our own guard, instrument rules, leverage or policy declined it.
+    RISK = "risk"
+    #: A normal market outcome, e.g. a limit that was never reached.
+    MARKET = "market"
+    #: The broker was already halted, so nothing was attempted.
+    HALTED = "halted"
+
+    @property
+    def counts_toward_breaker(self) -> bool:
+        return self is RejectionKind.VENUE
+
+
 class OrderStatus(str, Enum):
     """Terminal state of a submitted order."""
 
@@ -131,6 +156,9 @@ class OrderResult:
     filled_quantity: float = 0.0
     fill: Fill | None = None
     reason: str = ""
+    #: Set when status is REJECTED, so callers can tell an external refusal
+    #: from our own risk layer declining to trade.
+    rejection_kind: RejectionKind | None = None
 
     @property
     def requested_quantity(self) -> float:

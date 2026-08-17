@@ -23,7 +23,15 @@ from trading_bot.broker import (
 )
 from trading_bot.config import RunConfig
 from trading_bot.instruments import CRYPTO, EQUITY, WHOLE_SHARE, InstrumentSpec, build_spec
-from trading_bot.models import Candle, Fill, Order, OrderStatus, Side
+from trading_bot.models import (
+    Candle,
+    Fill,
+    Order,
+    OrderStatus,
+    OrderType,
+    RejectionKind,
+    Side,
+)
 
 
 def candle(price=100.0, day=1, symbol="X", high=None, low=None):
@@ -409,12 +417,12 @@ class TestRejectionCircuitBreaker(unittest.TestCase):
             setattr(engine, key, value)
         return engine, list(config.build_feed())
 
-    def reject_everything(self, broker):
+    def reject_everything(self, broker, kind=RejectionKind.VENUE):
         original = broker.submit
 
         def rejecting(order, candle, reference_price=None):
             if order.side is Side.BUY and not broker.halted:
-                return broker._reject(order, candle, "simulated venue rejection")
+                return broker._reject(order, candle, "simulated rejection", kind)
             return original(order, candle, reference_price)
 
         broker.submit = rejecting
@@ -449,7 +457,9 @@ class TestRejectionCircuitBreaker(unittest.TestCase):
             state["n"] += 1
             # Reject two, allow one, forever: never three in a row.
             if state["n"] % 3 != 0 and not broker.halted:
-                return broker._reject(order, candle, "intermittent rejection")
+                return broker._reject(
+                    order, candle, "intermittent rejection", RejectionKind.VENUE
+                )
             return original(order, candle, reference_price)
 
         broker.submit = sometimes
@@ -460,6 +470,75 @@ class TestRejectionCircuitBreaker(unittest.TestCase):
         engine, candles = self.build(max_consecutive_rejections=3)
         engine.run(candles)
         self.assertFalse(engine.broker.halted)
+
+    def test_risk_rejections_never_trip_the_breaker(self):
+        # Our own risk layer declining an order is the system working. Counting
+        # it would halt a long-only account fed short signals within a few bars.
+        engine, candles = self.build(max_consecutive_rejections=3)
+        self.reject_everything(engine.broker, kind=RejectionKind.RISK)
+        engine.run(candles)
+        self.assertFalse(engine.broker.halted)
+        self.assertGreater(len(engine.broker.rejections), 3)
+
+    def test_market_rejections_never_trip_the_breaker(self):
+        # An unfilled limit order is an ordinary outcome, not a fault.
+        engine, candles = self.build(max_consecutive_rejections=3)
+        self.reject_everything(engine.broker, kind=RejectionKind.MARKET)
+        engine.run(candles)
+        self.assertFalse(engine.broker.halted)
+
+    def test_a_long_only_account_survives_persistent_short_signals(self):
+        # End-to-end version of the bug: configuration alone used to halt.
+        config = RunConfig(strategy="sma-crossover", strategy_params={"allow_short": True},
+                           bars=400, cache_dir=None, allow_short=False,
+                           starting_cash=10_000.0)
+        engine = config.build_engine()
+        engine.run(config.build_feed())
+        self.assertFalse(engine.broker.halted, "risk policy must not halt the bot")
+        self.assertTrue(any("shorting disabled" in r for _, r in engine.broker.rejections))
+
+
+class TestRejectionKinds(unittest.TestCase):
+    def test_only_venue_counts_toward_the_breaker(self):
+        self.assertTrue(RejectionKind.VENUE.counts_toward_breaker)
+        for kind in (RejectionKind.RISK, RejectionKind.MARKET, RejectionKind.HALTED):
+            self.assertFalse(kind.counts_toward_breaker, kind)
+
+    def test_guard_rejections_are_risk(self):
+        broker = clean_broker(guard=OrderGuard(max_order_fraction=1.5))
+        bar = candle(100.0)
+        broker.mark(bar)
+        result = broker.submit(Order("X", Side.BUY, 1000), bar)
+        self.assertEqual(result.rejection_kind, RejectionKind.RISK)
+
+    def test_instrument_rule_rejections_are_risk(self):
+        broker = clean_broker(spec=WHOLE_SHARE)
+        bar = candle(100.0)
+        broker.mark(bar)
+        result = broker.submit(Order("X", Side.BUY, 0.4), bar)
+        self.assertEqual(result.rejection_kind, RejectionKind.RISK)
+
+    def test_shorting_policy_rejections_are_risk(self):
+        broker = clean_broker(allow_short=False)
+        bar = candle(100.0)
+        broker.mark(bar)
+        result = broker.submit(Order("X", Side.SELL, 5), bar)
+        self.assertEqual(result.rejection_kind, RejectionKind.RISK)
+
+    def test_unreached_limits_are_market(self):
+        broker = clean_broker()
+        bar = candle(100.0, high=101.0, low=99.0)
+        broker.mark(bar)
+        order = Order("X", Side.BUY, 10, type=OrderType.LIMIT, limit_price=95.0)
+        self.assertEqual(broker.submit(order, bar).rejection_kind, RejectionKind.MARKET)
+
+    def test_post_halt_rejections_are_halted(self):
+        broker = clean_broker()
+        bar = candle(100.0)
+        broker.mark(bar)
+        broker.kill("stop")
+        result = broker.submit(Order("X", Side.BUY, 1), bar)
+        self.assertEqual(result.rejection_kind, RejectionKind.HALTED)
 
 
 class TestAuditLog(unittest.TestCase):
