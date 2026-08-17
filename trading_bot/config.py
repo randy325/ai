@@ -10,7 +10,14 @@ from pathlib import Path
 from .broker import Commission, PaperBroker, SlippageModel
 from .data import CSVFeed, DataFeed, SyntheticFeed
 from .engine import TradingEngine
-from .providers import LiveFeed, MarketDataFeed, Provider, build_provider
+from .providers import (
+    LiveFeed,
+    MarketDataFeed,
+    MockProvider,
+    Provider,
+    SimulatedClock,
+    build_provider,
+)
 from .risk import FixedFractionSizer, PositionSizer, RiskLimits, RiskManager, VolatilitySizer
 from .strategy import Strategy, TrendFilter, build_strategy
 
@@ -140,19 +147,39 @@ class RunConfig:
         )
         return RiskManager(limits, self.build_sizer())
 
-    def build_live_feed(self, warmup: int = 200, max_bars: int | None = None) -> LiveFeed:
+    def build_live_feed(
+        self, warmup: int = 200, max_bars: int | None = None, speed: float = 1.0
+    ) -> LiveFeed:
         """A polling feed that yields each bar as it closes.
 
         Never cached — a cache would serve a stale bar as if it were new.
+
+        ``speed`` above 1 compresses time, so a 1m session produces a bar every
+        ``60 / speed`` real seconds. Only the mock provider can follow an
+        accelerated clock; a real one is bound to real time, and asking it to
+        hurry just polls an unchanged endpoint more often.
         """
         if not self.provider:
             raise ValueError("live paper trading needs --provider")
+
+        provider = build_provider(self.provider)
+        clock = SimulatedClock(speed)
+        if isinstance(provider, MockProvider):
+            provider.time_source = clock.now
+        elif speed != 1.0:
+            raise ValueError(
+                f"--speed only applies to the mock provider, not {self.provider!r}; "
+                "a real feed cannot produce bars faster than the market does"
+            )
+
         return LiveFeed(
-            provider=build_provider(self.provider),
+            provider=provider,
             symbol=self.symbol,
             interval=self.interval,
             warmup=warmup,
             max_bars=max_bars,
+            clock=clock.now,
+            sleeper=clock.sleep,
         )
 
     def build_engine(self) -> TradingEngine:

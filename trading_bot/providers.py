@@ -1,11 +1,12 @@
 """Live market data from public HTTP APIs.
 
-Four providers, none of which needs an API key:
+Four live providers, none of which needs an API key, plus a mock:
 
     stooq      daily/weekly stock, ETF and index bars (CSV)
     yahoo      stock and ETF bars, intraday to monthly (JSON)
     binance    crypto bars, 1m to 1w (JSON)
     coinbase   crypto bars, 1m to 1d (JSON)
+    mock       synthetic bars generated locally, for testing without a network
 
 Two ways to consume them. :class:`MarketDataFeed` fetches a block of history
 and replays it, so a backtest runs on real prices. :class:`LiveFeed` polls and
@@ -25,6 +26,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import time
 import urllib.error
 import urllib.parse
@@ -501,7 +503,119 @@ class CoinbaseProvider(Provider):
         return _clean(candles)[-limit:]
 
 
+class SimulatedClock:
+    """A wall clock that can run faster than real time.
+
+    ``speed`` of 60 makes a virtual minute pass every real second, so a 1m
+    ``paper`` session produces a bar per second instead of per minute. Sleeps
+    are divided by the same factor, which keeps :class:`LiveFeed`'s timing
+    arithmetic — expressed in virtual seconds — correct at any speed.
+    """
+
+    def __init__(self, speed: float = 1.0, sleeper: Callable[[float], None] = time.sleep) -> None:
+        if speed <= 0:
+            raise ValueError("speed must be positive")
+        self.speed = speed
+        self._sleeper = sleeper
+        self._real_origin = time.time()
+        self._origin = self._real_origin
+
+    def now(self) -> datetime:
+        elapsed = (time.time() - self._real_origin) * self.speed
+        return datetime.fromtimestamp(self._origin + elapsed, tz=timezone.utc)
+
+    def sleep(self, virtual_seconds: float) -> None:
+        self._sleeper(max(virtual_seconds, 0.0) / self.speed)
+
+
+class MockProvider(Provider):
+    """Generates synthetic bars anchored to the clock. No network involved.
+
+    Bars are a deterministic function of their absolute index, so the same
+    timestamp always carries the same price no matter when it is fetched, and
+    new bars appear as time passes — which is what :class:`LiveFeed` needs to
+    behave exactly as it would against a real provider.
+
+    The series is built from layered sine waves plus hashed noise rather than a
+    random walk. That is a deliberate trade: it is O(1) per bar and produces
+    trends, breakouts and reversals on demand, which makes it good for
+    exercising a strategy's plumbing. It is not a realistic market, and a
+    backtest against it says nothing about whether a strategy works.
+    """
+
+    name = "mock"
+    intervals = tuple(INTERVAL_SECONDS)
+
+    def __init__(
+        self,
+        transport: Transport | None = None,
+        seed: int = 7,
+        start_price: float = 100.0,
+        amplitude: float = 0.09,
+        noise: float = 0.004,
+        time_source: Callable[[], datetime] | None = None,
+    ) -> None:
+        super().__init__(transport or UrllibTransport())
+        self.seed = seed
+        self.start_price = start_price
+        self.amplitude = amplitude
+        self.noise = noise
+        self.time_source = time_source or _utc_now
+
+    def _jitter(self, index: int, salt: str) -> float:
+        """A stable pseudo-random value in [-1, 1] for this bar and purpose."""
+        digest = hashlib.sha256(f"{self.seed}:{salt}:{index}".encode()).digest()
+        return int.from_bytes(digest[:4], "big") / 0x7FFFFFFF - 1.0
+
+    def _price(self, index: int) -> float:
+        """Price for an absolute bar index.
+
+        Every term is bounded. Indices here are epoch-derived, so a 1m bar
+        today has an index around 29 million — any term growing with the index
+        (a linear drift, say) overflows to exp(580) rather than trending.
+        The slowest wave supplies the trend instead.
+        """
+        wave = (
+            math.sin(index / 2003.0 + self.seed) * 1.2
+            + math.sin(index / 61.0 + self.seed * 2) * 1.0
+            + math.sin(index / 17.0 + self.seed * 3) * 0.45
+            + math.sin(index / 7.0 + self.seed * 4) * 0.2
+        )
+        exponent = self.amplitude * wave + self.noise * self._jitter(index, "n")
+        return self.start_price * math.exp(exponent)
+
+    def _bar(self, index: int, interval: str, symbol: str) -> Candle:
+        seconds = INTERVAL_SECONDS[interval]
+        open_ = self._price(index)
+        close = self._price(index + 1)
+        span = abs(close - open_) + self.start_price * self.noise
+        high = max(open_, close) + span * abs(self._jitter(index, "h"))
+        low = min(open_, close) - span * abs(self._jitter(index, "l"))
+        return _candle(
+            datetime.fromtimestamp(index * seconds, tz=timezone.utc),
+            round(open_, 4),
+            round(high, 4),
+            round(max(low, 0.01), 4),
+            round(close, 4),
+            round(1_000 + 9_000 * abs(self._jitter(index, "v")), 2),
+            symbol.upper(),
+        )
+
+    def fetch(self, symbol: str, interval: str = "1d", limit: int = 500) -> list[Candle]:
+        self.check_interval(interval)
+        seconds = INTERVAL_SECONDS[interval]
+        # The bar containing "now" has not closed yet, so the newest closed bar
+        # is the one before it — the same rule the real providers follow.
+        current = int(self.time_source().timestamp()) // seconds
+        newest = current - 1
+        count = max(min(limit, newest + 1), 0)
+        if count <= 0:
+            raise SymbolNotFound(f"mock has no closed {interval} bars yet for {symbol!r}")
+        return [self._bar(i, interval, symbol) for i in range(newest - count + 1, newest + 1)]
+
+
 PROVIDERS: dict[str, type[Provider]] = {
+    MockProvider.name: MockProvider,
     StooqProvider.name: StooqProvider,
     YahooProvider.name: YahooProvider,
     BinanceProvider.name: BinanceProvider,

@@ -60,7 +60,7 @@ Run `python -m trading_bot <command> --help` for the full flag list.
 
 ## Live market data
 
-Four providers, none of which needs an API key:
+Four live providers, none of which needs an API key, plus a local mock:
 
 | Provider | Covers | Intervals | Symbol format |
 | --- | --- | --- | --- |
@@ -68,6 +68,7 @@ Four providers, none of which needs an API key:
 | `yahoo` | stocks, ETFs | `1m` … `1w` | `AAPL` |
 | `binance` | crypto | `1m` … `1w` | `BTCUSDT` |
 | `coinbase` | crypto | `1m` … `1d` | `BTC-USD` |
+| `mock` | generated locally | all | anything |
 
 ```bash
 python -m trading_bot providers
@@ -102,11 +103,47 @@ Three things it does deliberately:
   still move; Binance's most recent kline is dropped for exactly this reason.
 - **`--warmup 200` replays history first**, so a 200-period average is ready
   before the first live bar. A freshly started bot is otherwise blind for as
-  many bars as its slowest indicator needs.
+  many bars as its slowest indicator needs. Warmup bars prime the indicators
+  but place no orders and are left out of the equity curve — filling them would
+  open a position at prices that have already passed and credit the session
+  with P&L it never made.
 - **It does not liquidate when the session ends.** Stopping the loop is not a
   decision to close the position, so the open position is reported instead.
 
 It still places no real orders. It is a simulator being fed live prices.
+
+### Testing it locally with the mock provider
+
+Waiting a real minute per bar to find out whether your strategy wires up is a
+poor way to spend an afternoon. The `mock` provider generates bars locally —
+no network, no API key — and `--speed` compresses time, so a 1m session
+produces a bar every `60 / speed` seconds:
+
+```bash
+# 20 bars in about a second
+python -m trading_bot paper --provider mock --symbol MOCK --interval 1m \
+    --strategy rsi-breakout --warmup 200 --max-bars 20 --speed 500
+```
+
+Bars are a deterministic function of their timestamp, so a given bar always
+carries the same price however often it is fetched, and new bars appear as the
+clock advances — the live feed behaves exactly as it would against a real
+provider. `--speed` is rejected for the real providers, which cannot produce
+bars faster than the market does.
+
+It works for `backtest` and `fetch` too, which is the quickest way to exercise
+a new strategy end to end:
+
+```bash
+python -m trading_bot backtest --provider mock --symbol MOCK --limit 600 --strategy rsi-breakout
+python -m trading_bot fetch --provider mock --symbol MOCK --limit 1000 --out data/mock.csv
+```
+
+**The mock is not a market.** It is layered sine waves plus noise, so its
+trends are predictable by construction and every strategy scores absurdly well
+on it — Sharpe ratios above 3 are normal and meaningless. Commands print a
+warning when the mock is the data source. Use it to check that a strategy runs,
+sizes and exits as intended; use real data to find out whether it works.
 
 ## Strategies
 
@@ -116,8 +153,15 @@ It still places no real orders. It is a simulator being fed live prices.
 | `sma-crossover` | Long while the fast moving average is above the slow one |
 | `macd-trend` | Long while the MACD line is above zero |
 | `breakout` | Donchian channel breakout with an ATR trailing stop |
+| `rsi-breakout` | Breakout entries, filtered and exited by RSI |
 | `rsi-mean-reversion` | Buy oversold, exit when the RSI reverts to the middle |
 | `bollinger-reversion` | Fade moves outside the bands, exit at the middle band |
+
+`rsi-breakout` combines the two: the Donchian breakout supplies the entry
+trigger, and RSI adds what the raw breakout lacks — it declines to chase a
+breakout already extended past `--param max_entry_rsi=70`, and exits on
+momentum exhaustion at `--param exit_rsi=80`, usually earlier than the ATR
+trailing stop would. The stop and lower channel remain as backstops.
 
 Add `--allow-short` to let a strategy take the other side, and `--trend-filter 200`
 to suppress any trade fighting the 200-period EMA.
@@ -268,7 +312,7 @@ losers is noise — not as a way to pick the winner.
 python -m unittest discover -s tests
 ```
 
-277 tests covering position accounting through to the CLI. The ones worth
+319 tests covering position accounting through to the CLI. The ones worth
 knowing about assert properties that are easy to get quietly wrong: that a
 signal cannot be filled on its own bar, that buy-and-hold produces exactly one
 round trip (an early version churned 33 times as its fixed-fraction target

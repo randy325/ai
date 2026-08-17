@@ -59,6 +59,7 @@ class TradingEngine:
         risk: RiskManager,
         execute_on: str = "next_open",
         close_at_end: bool = True,
+        warmup_bars: int = 0,
         min_rebalance_fraction: float = MIN_REBALANCE_FRACTION,
         on_fill: Callable[[Fill], None] | None = None,
         on_bar: Callable[[Candle, Signal, float], None] | None = None,
@@ -70,6 +71,11 @@ class TradingEngine:
         self.risk = risk
         self.execute_on = execute_on
         self.close_at_end = close_at_end
+        if warmup_bars < 0:
+            raise ValueError("warmup_bars must be >= 0")
+        #: Leading bars fed to the strategy without trading, and left out of the
+        #: equity curve, so a live session's metrics describe the live part only.
+        self.warmup_bars = warmup_bars
         self.min_rebalance_fraction = min_rebalance_fraction
         self.on_fill = on_fill
         self.on_bar = on_bar
@@ -149,6 +155,15 @@ class TradingEngine:
 
             self.risk.observe(candle, equity)
             signal = self.strategy.on_candle(candle)
+
+            if bars <= self.warmup_bars:
+                # Replayed history: prime the indicators, but do not trade it.
+                # Filling these bars would open a position at prices that have
+                # already passed, and credit the session with P&L it never made.
+                if self.on_bar:
+                    self.on_bar(candle, signal, equity)
+                last_candle = candle
+                continue
 
             allowed, block_reason = self.risk.can_trade()
             target = self.risk.target_notional(signal, equity, candle)

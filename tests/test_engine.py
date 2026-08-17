@@ -5,7 +5,7 @@ from trading_bot.broker import Commission, PaperBroker, SlippageModel
 from trading_bot.engine import TradingEngine
 from trading_bot.models import Candle, Signal
 from trading_bot.risk import FixedFractionSizer, RiskLimits, RiskManager
-from trading_bot.strategy import BuyAndHold, Strategy
+from trading_bot.strategy import BuyAndHold, SMACrossover, Strategy
 
 
 def series(closes, symbol="X", opens=None):
@@ -210,6 +210,66 @@ class TestHalting(unittest.TestCase):
         engine = build_engine(AlwaysLong(), max_drawdown=None, daily_loss_limit=0.20)
         engine.run(series([100.0 + i * 0.1 for i in range(20)]))
         self.assertEqual(engine.risk.pause_count, 0)
+
+
+class TestWarmupBars(unittest.TestCase):
+    def build(self, warmup, strategy=None):
+        broker = PaperBroker(
+            starting_cash=10_000.0,
+            commission=Commission(percent=0.0),
+            slippage=SlippageModel(percent=0.0),
+        )
+        risk = RiskManager(RiskLimits(max_drawdown=None), FixedFractionSizer(1.0))
+        return TradingEngine(
+            strategy or AlwaysLong(), broker, risk,
+            close_at_end=False, warmup_bars=warmup,
+        )
+
+    def test_no_trades_are_placed_during_warmup(self):
+        # Replayed history must not open a position at prices already past.
+        engine = self.build(warmup=10)
+        engine.run(series([100.0 + i for i in range(10)]))
+        self.assertEqual(engine.broker.fills, [])
+        self.assertAlmostEqual(engine.broker.cash, 10_000.0)
+        self.assertTrue(engine.broker.position("X").is_flat)
+
+    def test_trading_resumes_after_warmup(self):
+        engine = self.build(warmup=5)
+        engine.run(series([100.0 + i for i in range(20)]))
+        self.assertTrue(engine.broker.fills)
+
+    def test_warmup_bars_are_excluded_from_the_equity_curve(self):
+        engine = self.build(warmup=8)
+        result = engine.run(series([100.0 + i for i in range(20)]))
+        self.assertEqual(len(result.equity_curve), 12)
+        self.assertEqual(result.bars, 20, "every bar is still consumed")
+
+    def test_equity_is_untouched_through_warmup(self):
+        engine = self.build(warmup=15)
+        result = engine.run(series([100.0 + i for i in range(16)]))
+        self.assertAlmostEqual(result.equity_curve[0].equity, 10_000.0)
+
+    def test_indicators_are_primed_by_warmup(self):
+        # A 10-period average is ready immediately after a 12-bar warmup, so
+        # the first live bar can trade instead of waiting another 10.
+        engine = self.build(warmup=12, strategy=SMACrossover(3, 10))
+        engine.run(series([100.0 + i for i in range(15)]))
+        self.assertTrue(engine.broker.fills)
+
+    def test_zero_warmup_is_the_default_behaviour(self):
+        engine = self.build(warmup=0)
+        result = engine.run(series([100.0 + i for i in range(10)]))
+        self.assertEqual(len(result.equity_curve), 10)
+
+    def test_negative_warmup_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.build(warmup=-1)
+
+    def test_warmup_longer_than_the_feed_trades_nothing(self):
+        engine = self.build(warmup=100)
+        result = engine.run(series([100.0 + i for i in range(10)]))
+        self.assertEqual(engine.broker.fills, [])
+        self.assertEqual(result.equity_curve, [])
 
 
 class TestCallbacks(unittest.TestCase):

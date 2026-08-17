@@ -169,6 +169,18 @@ def _config_from_args(args: argparse.Namespace, strategy: str | None = None) -> 
     return config
 
 
+MOCK_WARNING = (
+    "NOTE: the mock provider generates a periodic synthetic series, not a market. "
+    "Its trends are predictable by construction, so these numbers measure nothing "
+    "about the strategy. Use it to exercise the plumbing, not to evaluate an edge."
+)
+
+
+def _warn_if_mock(provider: str | None) -> None:
+    if provider == "mock":
+        print(f"\n{MOCK_WARNING}")
+
+
 def _run(config: RunConfig) -> BacktestResult:
     engine = config.build_engine()
     return engine.run(config.build_feed())
@@ -238,6 +250,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
                 print(f"... and {len(result.trades) - args.show_trades} more")
 
     _export(result, args.export_equity, args.export_trades)
+    _warn_if_mock(config.provider)
     return 0
 
 
@@ -269,6 +282,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
             f"{m.max_drawdown:>9.1%}{m.num_trades:>8}{m.win_rate:>8.0%}"
         )
     print(f"\nRanked by Sharpe ratio. Best: {rows[0][0]}")
+    _warn_if_mock(args.provider)
     return 0
 
 
@@ -316,6 +330,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "\nNote: the best row here is the best fit to this one price series. "
         "Expect materially worse results out of sample."
     )
+    _warn_if_mock(args.provider)
     return 0
 
 
@@ -373,10 +388,14 @@ def cmd_paper(args: argparse.Namespace) -> int:
 
     engine = config.build_engine()
     engine.close_at_end = False
-    feed = config.build_live_feed(warmup=args.warmup, max_bars=args.max_bars)
+    engine.warmup_bars = args.warmup
+    feed = config.build_live_feed(
+        warmup=args.warmup, max_bars=args.max_bars, speed=args.speed
+    )
 
     print(
-        f"Paper trading {config.symbol} {config.interval} bars from {config.provider}.\n"
+        f"Paper trading {config.symbol} {config.interval} bars from {config.provider}"
+        f"{f' at {args.speed:g}x speed' if args.speed != 1.0 else ''}.\n"
         f"Strategy: {engine.strategy.describe()}\n"
         f"Starting cash: ${config.starting_cash:,.2f}   "
         f"{'Bars: ' + str(args.max_bars) if args.max_bars else 'Running until interrupted'}\n"
@@ -497,6 +516,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="historical bars to prime indicators (default: 200)")
     paper.add_argument("--max-bars", type=int, default=None,
                        help="stop after this many live bars")
+    paper.add_argument("--speed", type=float, default=1.0,
+                       help="compress time by this factor (mock provider only): "
+                            "--speed 60 gives a 1m bar every real second")
     _add_common_arguments(paper)
     paper.set_defaults(func=cmd_paper)
 

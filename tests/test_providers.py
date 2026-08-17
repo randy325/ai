@@ -8,6 +8,7 @@ habit of reporting errors as HTTP 200 with a plain-text body.
 
 import json
 import logging
+import math
 import tempfile
 import time
 import unittest
@@ -17,6 +18,8 @@ from pathlib import Path
 from trading_bot.providers import (
     PROVIDERS,
     BinanceProvider,
+    MockProvider,
+    SimulatedClock,
     CachingTransport,
     CoinbaseProvider,
     DataFeedError,
@@ -487,6 +490,121 @@ class TestSharedProviderBehaviour(unittest.TestCase):
         provider.fetch("AAPL")
         provider.fetch("AAPL")
         self.assertEqual(slept, [])
+
+
+class TestMockProvider(unittest.TestCase):
+    def at(self, moment, **kwargs):
+        return MockProvider(time_source=lambda: moment, **kwargs)
+
+    def test_prices_stay_sane_at_every_interval(self):
+        # Indices are epoch-derived, so a 1m bar today sits around index 29
+        # million. A term growing with the index overflowed to exp(580).
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        for interval in MockProvider.intervals:
+            for candle in self.at(now).fetch("MOCK", interval, 50):
+                self.assertTrue(math.isfinite(candle.close), interval)
+                self.assertLess(candle.close, 10_000, interval)
+                self.assertGreater(candle.close, 0.01, interval)
+
+    def test_far_future_clock_does_not_overflow(self):
+        candles = self.at(datetime(2195, 1, 1, tzinfo=timezone.utc)).fetch("MOCK", "1m", 10)
+        self.assertTrue(all(math.isfinite(c.close) for c in candles))
+
+    def test_a_bar_keeps_its_price_as_time_passes(self):
+        early = self.at(datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)).fetch("MOCK", "1m", 30)
+        later = self.at(datetime(2026, 8, 17, 12, 20, tzinfo=timezone.utc)).fetch("MOCK", "1m", 60)
+        overlap = {c.timestamp: c.close for c in later}
+        for candle in early:
+            self.assertAlmostEqual(overlap[candle.timestamp], candle.close, places=6)
+
+    def test_new_bars_appear_as_time_advances(self):
+        base = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        before = self.at(base).fetch("MOCK", "1m", 5)
+        after = self.at(base + timedelta(minutes=3)).fetch("MOCK", "1m", 5)
+        self.assertGreater(after[-1].timestamp, before[-1].timestamp)
+
+    def test_the_forming_bar_is_excluded(self):
+        now = datetime(2026, 8, 17, 12, 0, 30, tzinfo=timezone.utc)
+        candles = self.at(now).fetch("MOCK", "1m", 5)
+        self.assertLess(candles[-1].timestamp, now.replace(second=0, microsecond=0))
+
+    def test_different_seeds_produce_different_series(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        first = [c.close for c in self.at(now, seed=1).fetch("MOCK", "1d", 20)]
+        second = [c.close for c in self.at(now, seed=2).fetch("MOCK", "1d", 20)]
+        self.assertNotEqual(first, second)
+
+    def test_ohlc_invariants_hold(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        for candle in self.at(now).fetch("MOCK", "1h", 200):
+            self.assertLessEqual(candle.low, min(candle.open, candle.close))
+            self.assertGreaterEqual(candle.high, max(candle.open, candle.close))
+            self.assertGreater(candle.volume, 0)
+
+    def test_timestamps_are_evenly_spaced_and_ascending(self):
+        now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        candles = self.at(now).fetch("MOCK", "5m", 20)
+        gaps = {
+            (b.timestamp - a.timestamp).total_seconds()
+            for a, b in zip(candles, candles[1:])
+        }
+        self.assertEqual(gaps, {300.0})
+
+    def test_needs_no_network(self):
+        class Explode(Transport):
+            def get(self, url, headers=None):
+                raise AssertionError("the mock provider must never make a request")
+
+        provider = MockProvider(Explode(), time_source=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+        self.assertEqual(len(provider.fetch("MOCK", "1d", 10)), 10)
+
+    def test_is_registered(self):
+        self.assertIn("mock", PROVIDERS)
+        self.assertIsInstance(build_provider("mock"), MockProvider)
+
+
+class TestSimulatedClock(unittest.TestCase):
+    def test_sleep_is_divided_by_speed(self):
+        slept = []
+        clock = SimulatedClock(speed=60.0, sleeper=slept.append)
+        clock.sleep(120.0)
+        self.assertAlmostEqual(slept[0], 2.0, msg="120 virtual seconds at 60x is 2 real seconds")
+
+    def test_speed_of_one_sleeps_normally(self):
+        slept = []
+        SimulatedClock(speed=1.0, sleeper=slept.append).sleep(3.0)
+        self.assertAlmostEqual(slept[0], 3.0)
+
+    def test_negative_sleep_is_clamped(self):
+        slept = []
+        SimulatedClock(speed=2.0, sleeper=slept.append).sleep(-50.0)
+        self.assertEqual(slept, [0.0])
+
+    def test_time_advances_faster_than_real_time(self):
+        clock = SimulatedClock(speed=100_000.0, sleeper=lambda _: None)
+        first = clock.now()
+        time.sleep(0.01)
+        self.assertGreater((clock.now() - first).total_seconds(), 100)
+
+    def test_rejects_non_positive_speed(self):
+        with self.assertRaises(ValueError):
+            SimulatedClock(speed=0)
+
+
+class TestMockDrivesLiveFeed(unittest.TestCase):
+    def test_live_feed_emits_mock_bars_without_a_network(self):
+        clock = SimulatedClock(speed=500_000.0)
+        provider = MockProvider(time_source=clock.now)
+        feed = LiveFeed(
+            provider=provider, symbol="MOCK", interval="1m",
+            warmup=10, max_bars=3, clock=clock.now, sleeper=clock.sleep,
+        )
+        candles = list(feed)
+        self.assertEqual(len(candles), 13, "10 warmup bars plus 3 live ones")
+        self.assertEqual(feed.live_bars, 3)
+        timestamps = [c.timestamp for c in candles]
+        self.assertEqual(len(timestamps), len(set(timestamps)))
+        self.assertEqual(timestamps, sorted(timestamps))
 
 
 class TestBuildProvider(unittest.TestCase):

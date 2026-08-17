@@ -8,6 +8,7 @@ from trading_bot.strategy import (
     Breakout,
     BuyAndHold,
     MACDTrend,
+    RSIBreakout,
     RSIMeanReversion,
     SMACrossover,
     TrendFilter,
@@ -132,6 +133,94 @@ class TestBreakout(unittest.TestCase):
     def test_never_goes_short(self):
         signals = run(Breakout(lookback=5, exit_lookback=3, atr_period=3), [200 - i for i in range(60)])
         self.assertTrue(all(s.target >= 0 for s in signals))
+
+
+class TestRSIBreakout(unittest.TestCase):
+    QUIET = [100 + (i % 3) for i in range(40)]
+
+    def test_rejects_invalid_thresholds(self):
+        with self.assertRaises(ValueError):
+            RSIBreakout(max_entry_rsi=0)
+        with self.assertRaises(ValueError):
+            RSIBreakout(exit_rsi=120)
+        with self.assertRaises(ValueError):
+            RSIBreakout(lookback=1)
+
+    def test_exit_rsi_must_exceed_entry_filter(self):
+        # Otherwise every entry would exit on the bar it opened.
+        with self.assertRaises(ValueError) as ctx:
+            RSIBreakout(max_entry_rsi=70, exit_rsi=60)
+        self.assertIn("exit_rsi must exceed", str(ctx.exception))
+
+    def test_flat_until_indicators_are_ready(self):
+        signals = run(RSIBreakout(lookback=10, exit_lookback=5, atr_period=5, rsi_period=5),
+                      [100 + i for i in range(8)])
+        self.assertTrue(all(s.target == 0.0 for s in signals))
+
+    def test_enters_on_a_breakout_with_moderate_rsi(self):
+        # A gentle rise keeps RSI below the filter while still breaking out.
+        prices = self.QUIET + [100 + i * 0.8 for i in range(25)]
+        strategy = RSIBreakout(lookback=10, exit_lookback=5, atr_period=5,
+                               rsi_period=5, max_entry_rsi=95, exit_rsi=99)
+        signals = run(strategy, prices)
+        self.assertTrue(any(s.target == 1.0 for s in signals))
+
+    def test_entry_carries_a_stop_price(self):
+        prices = self.QUIET + [100 + i * 0.8 for i in range(25)]
+        strategy = RSIBreakout(lookback=10, exit_lookback=5, atr_period=5,
+                               rsi_period=5, max_entry_rsi=95, exit_rsi=99)
+        entry = next(s for s in run(strategy, prices) if s.target == 1.0)
+        self.assertIsNotNone(entry.stop_price)
+
+    def test_overbought_breakout_is_declined(self):
+        # A vertical ramp breaks out with RSI pinned near 100; the filter is
+        # the whole point of combining the two indicators.
+        prices = self.QUIET + [100 + i * 8 for i in range(20)]
+        strategy = RSIBreakout(lookback=10, exit_lookback=5, atr_period=5,
+                               rsi_period=5, max_entry_rsi=70, exit_rsi=90)
+        signals = run(strategy, prices)
+        self.assertTrue(all(s.target == 0.0 for s in signals))
+        self.assertTrue(any("extended" in s.reason for s in signals))
+
+    def test_a_lenient_filter_takes_the_same_breakout(self):
+        # Same series, filter relaxed: proves the decline above is the RSI
+        # filter and not simply a failure to detect the breakout.
+        prices = self.QUIET + [100 + i * 8 for i in range(20)]
+        strategy = RSIBreakout(lookback=10, exit_lookback=5, atr_period=5,
+                               rsi_period=5, max_entry_rsi=99.9, exit_rsi=100)
+        self.assertTrue(any(s.target == 1.0 for s in run(strategy, prices)))
+
+    def test_exits_when_rsi_is_exhausted(self):
+        prices = self.QUIET + [100 + i * 0.8 for i in range(12)] + [110 + i * 6 for i in range(12)]
+        strategy = RSIBreakout(lookback=10, exit_lookback=5, atr_period=5,
+                               rsi_period=5, max_entry_rsi=80, exit_rsi=90)
+        signals = run(strategy, prices)
+        entered = next(i for i, s in enumerate(signals) if s.target == 1.0)
+        after = signals[entered:]
+        self.assertTrue(any(s.target == 0.0 and "exhausted" in s.reason for s in after))
+
+    def test_exits_when_the_trend_breaks(self):
+        prices = (
+            self.QUIET
+            + [100 + i * 0.8 for i in range(25)]
+            + [120 - i * 5 for i in range(20)]
+        )
+        strategy = RSIBreakout(lookback=10, exit_lookback=5, atr_period=5,
+                               rsi_period=5, max_entry_rsi=95, exit_rsi=99)
+        signals = run(strategy, prices)
+        entered = next(i for i, s in enumerate(signals) if s.target == 1.0)
+        self.assertEqual(signals[-1].target, 0.0)
+        self.assertTrue(any(s.target == 0.0 for s in signals[entered:]))
+
+    def test_never_goes_short(self):
+        strategy = RSIBreakout(lookback=5, exit_lookback=3, atr_period=3, rsi_period=3)
+        signals = run(strategy, [200 - i for i in range(60)])
+        self.assertTrue(all(s.target >= 0 for s in signals))
+
+    def test_is_registered_and_describable(self):
+        strategy = build_strategy("rsi-breakout", lookback=15)
+        self.assertIn("lookback=15", strategy.describe())
+        self.assertIn("rsi", strategy.describe())
 
 
 class TestMACDTrend(unittest.TestCase):

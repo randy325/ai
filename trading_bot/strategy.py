@@ -194,6 +194,100 @@ class Breakout(Strategy):
         return Signal(1.0, reason="riding trend", stop_price=trailing_stop)
 
 
+class RSIBreakout(Strategy):
+    """Breakout entries, filtered and exited by RSI.
+
+    The breakout supplies the trigger: price closing above the highest high of
+    the lookback window. RSI supplies two things the raw breakout lacks — a
+    filter that declines to chase a breakout already extended past
+    ``max_entry_rsi``, and an exit when momentum becomes exhausted at
+    ``exit_rsi``, which typically leaves earlier than the trailing stop would.
+
+    The position is otherwise managed like :class:`Breakout`: an ATR stop
+    trailing the running peak, plus the lower channel as a backstop.
+    """
+
+    name = "rsi-breakout"
+
+    def __init__(
+        self,
+        lookback: int = 20,
+        exit_lookback: int = 10,
+        atr_period: int = 14,
+        atr_stop: float = 2.5,
+        rsi_period: int = 14,
+        max_entry_rsi: float = 70.0,
+        exit_rsi: float = 80.0,
+    ) -> None:
+        if lookback < 2 or exit_lookback < 2:
+            raise ValueError("lookback windows must be >= 2")
+        if not 0 < max_entry_rsi < 100:
+            raise ValueError("max_entry_rsi must be within (0, 100)")
+        if not 0 < exit_rsi <= 100:
+            raise ValueError("exit_rsi must be within (0, 100]")
+        if exit_rsi <= max_entry_rsi:
+            raise ValueError(
+                "exit_rsi must exceed max_entry_rsi, or every entry exits on the bar it opens"
+            )
+        self.channel = RollingHighLow(lookback)
+        self.exit_channel = RollingHighLow(exit_lookback)
+        self.atr = ATR(atr_period)
+        self.rsi = RSI(rsi_period)
+        self.atr_stop = atr_stop
+        self.max_entry_rsi = max_entry_rsi
+        self.exit_rsi = exit_rsi
+        self._in_position = False
+        self._peak = 0.0
+
+    def describe(self) -> str:
+        return (
+            f"{self.name}(lookback={self.channel.period}, exit={self.exit_channel.period}, "
+            f"atr_stop={self.atr_stop}, entry_rsi<{self.max_entry_rsi}, exit_rsi>{self.exit_rsi})"
+        )
+
+    def on_candle(self, candle: Candle) -> Signal:
+        # Read the channel before this bar updates it, so a breakout is
+        # measured against prior bars rather than including itself.
+        breakout_level = self.channel.highest
+        exit_level = self.exit_channel.lowest
+        atr = self.atr.update_candle(candle)
+        rsi = self.rsi.update(candle.close)
+        self.channel.update_candle(candle)
+        self.exit_channel.update_candle(candle)
+
+        if breakout_level is None or atr is None or rsi is None:
+            return FLAT
+
+        if not self._in_position:
+            if candle.close <= breakout_level:
+                return FLAT
+            if rsi > self.max_entry_rsi:
+                return Signal(0.0, reason=f"breakout but RSI {rsi:.0f} already extended")
+            self._in_position = True
+            self._peak = candle.close
+            stop = candle.close - self.atr_stop * atr
+            return Signal(
+                1.0,
+                reason=f"broke {breakout_level:.2f}, RSI {rsi:.0f}",
+                stop_price=stop,
+            )
+
+        self._peak = max(self._peak, candle.high)
+        trailing_stop = self._peak - self.atr_stop * atr
+
+        if rsi >= self.exit_rsi:
+            self._in_position = False
+            return Signal(0.0, reason=f"RSI {rsi:.0f} exhausted")
+        if candle.close < trailing_stop:
+            self._in_position = False
+            return Signal(0.0, reason=f"trailing stop {trailing_stop:.2f}")
+        if exit_level is not None and candle.close < exit_level:
+            self._in_position = False
+            return Signal(0.0, reason=f"lost channel {exit_level:.2f}")
+
+        return Signal(1.0, reason=f"riding trend, RSI {rsi:.0f}", stop_price=trailing_stop)
+
+
 class MACDTrend(Strategy):
     """Long while the MACD line is above zero; optionally short when below.
 
@@ -304,6 +398,7 @@ STRATEGIES: dict[str, Callable[..., Strategy]] = {
     SMACrossover.name: SMACrossover,
     RSIMeanReversion.name: RSIMeanReversion,
     Breakout.name: Breakout,
+    RSIBreakout.name: RSIBreakout,
     MACDTrend.name: MACDTrend,
     BollingerReversion.name: BollingerReversion,
 }

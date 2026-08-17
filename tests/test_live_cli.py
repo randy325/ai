@@ -229,46 +229,92 @@ class TestLiveCLI(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("provider", err)
 
-    def test_paper_runs_a_bounded_live_session(self):
-        provider = ScriptedProvider()
-
-        def build_live_feed(self, warmup=200, max_bars=None):
-            return LiveFeed(
-                provider=provider, symbol=self.symbol, interval="1m",
-                warmup=warmup, max_bars=max_bars,
-                sleeper=lambda _: None,
-                clock=lambda: datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc),
-            )
-
-        with mock.patch.object(RunConfig, "build_live_feed", build_live_feed):
-            code, out, _ = self.run_cli(
-                ["paper", "--provider", "stooq", "--symbol", "TEST",
-                 "--strategy", "buy-and-hold", "--warmup", "3", "--max-bars", "2"]
-            )
+    def test_paper_runs_end_to_end_on_the_mock_provider(self):
+        # No stubbing and no network: the real command, the real feed, the
+        # real engine, with time compressed so three 1m bars take milliseconds.
+        code, out, _ = self.run_cli(
+            ["paper", "--provider", "mock", "--symbol", "MOCK", "--interval", "1m",
+             "--strategy", "buy-and-hold", "--warmup", "20", "--max-bars", "3",
+             "--speed", "500000", "--cash", "10000"]
+        )
         self.assertEqual(code, 0)
-        self.assertIn("Paper trading", out)
+        self.assertIn("Paper trading MOCK", out)
         self.assertIn("No real orders are placed", out)
         self.assertIn("Final equity", out)
 
+    def test_paper_reports_speed_in_the_banner(self):
+        code, out, _ = self.run_cli(
+            ["paper", "--provider", "mock", "--symbol", "MOCK", "--interval", "1m",
+             "--strategy", "buy-and-hold", "--warmup", "5", "--max-bars", "1",
+             "--speed", "500000"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("speed", out)
+
     def test_paper_leaves_the_position_open_at_the_end(self):
-        provider = ScriptedProvider()
-
-        def build_live_feed(self, warmup=200, max_bars=None):
-            return LiveFeed(
-                provider=provider, symbol=self.symbol, interval="1m",
-                warmup=warmup, max_bars=max_bars,
-                sleeper=lambda _: None,
-                clock=lambda: datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc),
-            )
-
-        with mock.patch.object(RunConfig, "build_live_feed", build_live_feed):
-            code, out, _ = self.run_cli(
-                ["paper", "--provider", "stooq", "--symbol", "TEST",
-                 "--strategy", "buy-and-hold", "--warmup", "2", "--max-bars", "3"]
-            )
+        code, out, _ = self.run_cli(
+            ["paper", "--provider", "mock", "--symbol", "MOCK", "--interval", "1m",
+             "--strategy", "buy-and-hold", "--warmup", "20", "--max-bars", "3",
+             "--speed", "500000"]
+        )
         self.assertEqual(code, 0)
         # A live session must not liquidate just because the loop stopped.
         self.assertIn("Open position", out)
+
+    def test_paper_emits_one_row_per_live_bar(self):
+        code, out, _ = self.run_cli(
+            ["paper", "--provider", "mock", "--symbol", "MOCK", "--interval", "1m",
+             "--strategy", "buy-and-hold", "--warmup", "10", "--max-bars", "4",
+             "--speed", "500000"]
+        )
+        self.assertEqual(code, 0)
+        rows = [line for line in out.splitlines() if line.startswith("20")]
+        self.assertEqual(len(rows), 4, "warmup bars must not be printed as live rows")
+
+    def test_speed_is_rejected_for_a_real_provider(self):
+        code, _, err = self.run_cli(
+            ["paper", "--provider", "stooq", "--symbol", "AAPL", "--speed", "60"]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("only applies to the mock provider", err)
+
+    def test_backtest_runs_on_the_mock_provider(self):
+        code, out, _ = self.run_cli(
+            ["backtest", "--provider", "mock", "--symbol", "MOCK",
+             "--strategy", "rsi-breakout", "--limit", "400", "--no-cache"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("MOCK", out)
+        self.assertIn("Total return", out)
+
+    def test_mock_results_carry_a_warning(self):
+        # Sinusoidal mock data produces flattering numbers; unlabelled, they
+        # would read as a real result.
+        for argv in (
+            ["backtest", "--provider", "mock", "--symbol", "MOCK", "--limit", "200", "--no-cache"],
+            ["compare", "--provider", "mock", "--symbol", "MOCK", "--limit", "200", "--no-cache"],
+        ):
+            code, out, _ = self.run_cli(argv)
+            self.assertEqual(code, 0, argv[0])
+            self.assertIn("measure nothing about the strategy", out, argv[0])
+
+    def test_real_provider_results_carry_no_mock_warning(self):
+        with mock.patch.object(config_module, "build_provider", stub_stooq):
+            code, out, _ = self.run_cli(
+                ["backtest", "--provider", "stooq", "--symbol", "AAPL", "--no-cache"]
+            )
+        self.assertEqual(code, 0)
+        self.assertNotIn("measure nothing", out)
+
+    def test_fetch_works_offline_with_the_mock_provider(self):
+        path = self.dir / "mock.csv"
+        code, out, _ = self.run_cli(
+            ["fetch", "--provider", "mock", "--symbol", "MOCK",
+             "--limit", "50", "--no-cache", "--out", str(path)]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Fetched 50", out)
+        self.assertTrue(path.exists())
 
 
 if __name__ == "__main__":
