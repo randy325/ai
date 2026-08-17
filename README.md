@@ -369,30 +369,30 @@ python scripts/robustness_sweep.py --strategy rsi-breakout
 ```
 
 Varies each numeric parameter ±30% around its current value, running every
-setting across several synthetic paths and taking the median so one lucky path
-cannot make a parameter look good. It reports the *shape* of the performance
-surface, not the level:
+setting across several synthetic paths. It answers two questions in order, and
+the second only matters if the first passes:
 
-- **roughness** — mean step between neighbouring settings over the total range.
-  A smooth curve over *n* points steps about `1/(n-1)` of its range each time;
-  an alternating surface approaches 100%. Above 50% the neighbours of a setting
-  tell you nothing about it, so the setting is a draw from noise.
-- **peaked** — the configured value is the single best *and* clears the median
-  of its neighbours. That is the signature of a value that was tuned rather
-  than found.
-- **no effect** — varying it changed nothing, so it is inert in this
-  configuration. Not overfit, but not doing anything either.
+**Can the sweep resolve anything?** Each point is a median over seeds, so it
+carries its own standard error. `resolving power` is the spread *between*
+settings divided by the error *within* them; below about 2 the shape is an
+artefact of the seed count. `true signal` removes the noise the observed spread
+contains (`observed² = signal² + noise²`) — when it reads zero the surface is
+genuinely flat and more seeds will not help, because there is nothing to find.
 
-The two detectors are complementary, and neither subsumes the other: a lone
-spike surrounded by flat values scores *low* on roughness, because only two of
-its steps are non-zero — that shape is what `is_peaked` exists to catch.
+**Is the surface rougher than chance?** `roughness` is the mean step between
+neighbouring settings over the total range. Its null distribution depends
+strongly on the point count — pure noise averages 0.67 at 3 settings and 0.28
+at 31 — so the cutoff is simulated per point count rather than fixed, and
+readings are classified three ways against it: `jagged` above the 95th
+percentile, `smooth` below the 5th, and `noise` across the wide middle where
+the statistic cannot tell. `PEAKED` is separate, catching a lone spike that
+roughness misses because only two of its steps are non-zero.
 
-**Read the returns in this sweep as a null result, not a verdict.** On a random
-walk with real costs the expected return of any strategy is negative, so
-near-zero numbers are exactly what should appear. A profitable sweep here would
-suggest a bug rather than an edge. Synthetic data can answer "does this depend
-on precise parameter values" honestly, because there is no market structure to
-overfit *to* — it cannot answer "does this make money". Use
+**Current result on synthetic data: nothing resolves.** All four strategies
+report UNRESOLVED at 15×25, with a noise-corrected signal of zero. That is the
+correct answer rather than a limitation — a geometric random walk has no
+parameter-dependent structure, so there is no surface to measure. Synthetic
+data can falsify a badly overfit parameter set; it cannot validate one. Use
 `scripts/evaluate_real.py` on real bars for that.
 
 ## Tests

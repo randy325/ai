@@ -19,6 +19,8 @@ path cannot make a parameter look good.
 """
 
 import argparse
+import math
+import random
 import statistics
 import sys
 from pathlib import Path
@@ -79,8 +81,93 @@ def roughness(returns: list[float]) -> float:
 
 
 def smooth_reference(count: int) -> float:
-    """The roughness a perfectly monotonic sweep of ``count`` points would show."""
+    """Roughness of a perfectly monotonic sweep. NOT a decision threshold.
+
+    This is the value a noiseless straight line would produce. It was
+    previously used as the yardstick, which was wrong: the question is not
+    "is this rougher than a perfect ramp" — almost everything is — but "is
+    this rougher than noise". Use :func:`null_roughness` for that.
+    """
     return 1.0 / (count - 1) if count > 1 else 0.0
+
+
+_NULL_CACHE: dict[tuple[int, int, int], list[float]] = {}
+
+
+def null_roughness(count: int, trials: int = 20_000, seed: int = 20240817) -> list[float]:
+    """Sorted roughness values for ``count`` iid random points.
+
+    This is the distribution the statistic takes when the surface carries no
+    shape at all and every point is sampling noise. It depends strongly on the
+    point count — the mean runs about 0.67 at 3 points and 0.28 at 31 — which
+    is why a single hardcoded cutoff cannot work.
+    """
+    key = (count, trials, seed)
+    if key not in _NULL_CACHE:
+        rng = random.Random(seed + count)
+        _NULL_CACHE[key] = sorted(
+            roughness([rng.gauss(0.0, 1.0) for _ in range(count)]) for _ in range(trials)
+        )
+    return _NULL_CACHE[key]
+
+
+def null_percentile(count: int, percentile: float, **kwargs) -> float:
+    """A percentile of the null roughness distribution for ``count`` points."""
+    values = null_roughness(count, **kwargs)
+    if not values:
+        return 0.0
+    index = min(max(int(percentile * (len(values) - 1)), 0), len(values) - 1)
+    return values[index]
+
+
+def classify_roughness(value: float, count: int, alpha: float = 0.05) -> str:
+    """Compare measured roughness against the noise distribution.
+
+    Returns "jagged" above the upper tail, "smooth" below the lower tail, and
+    "noise" in between — where the statistic simply cannot tell the difference
+    between a real surface and a random one.
+    """
+    if count < 3:
+        return "noise"
+    if value > null_percentile(count, 1.0 - alpha):
+        return "jagged"
+    if value < null_percentile(count, alpha):
+        return "smooth"
+    return "noise"
+
+
+def resolving_power(per_seed: list[list[float]]) -> tuple[float, float, float, float]:
+    """Between-point signal against within-point sampling noise.
+
+    Each sweep point is a median over seeds, so it carries its own standard
+    error. If the spread *between* points is no larger than the error *within*
+    them, the shape being measured is an artefact of how many seeds were run,
+    and no verdict about the surface is meaningful.
+
+    ``true_between`` removes the sampling noise the observed spread contains:
+    the medians scatter even when every point shares one true value, so
+    observed² = signal² + noise². When it comes out at zero the surface is flat
+    and no amount of extra seeds will resolve it, because there is nothing to
+    resolve — the ratio stays put while both terms shrink together.
+
+    Returns (between, within, ratio, true_between).
+    """
+    points = [p for p in per_seed if len(p) >= 2]
+    if len(points) < 2:
+        return 0.0, 0.0, 0.0, 0.0
+    medians = [statistics.median(p) for p in points]
+    between = statistics.pstdev(medians)
+    # Each point is summarised by a MEDIAN, so the error to compare against is
+    # the standard error of the median, not of the mean. For roughly normal
+    # samples that is sqrt(pi/2) ~ 1.2533 times larger; using the mean's error
+    # understated within-point noise by about a quarter and left a flat surface
+    # looking like it still carried signal.
+    median_se = math.sqrt(math.pi / 2.0)
+    errors = [median_se * statistics.pstdev(p) / math.sqrt(len(p)) for p in points]
+    within = statistics.median(errors)
+    ratio = between / within if within > 1e-12 else math.inf
+    true_between = math.sqrt(max(between**2 - within**2, 0.0))
+    return between, within, ratio, true_between
 
 
 def is_peaked(values: list, returns: list[float], default) -> tuple[bool, float]:
@@ -114,6 +201,9 @@ def score(strategy: str, params: dict, seeds: list[int], bars: int, cash: float)
         "trades": statistics.median(trades),
         "sharpe": statistics.median(sharpes),
         "worst": min(returns),
+        # Kept so the sweep can separate variation between settings from
+        # sampling noise within a single setting.
+        "per_seed": returns,
     }
 
 
@@ -122,9 +212,11 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--strategy", default="rsi-breakout", choices=sorted(STRATEGIES))
     parser.add_argument("--spread", type=float, default=0.30, help="vary by +/- this fraction")
-    parser.add_argument("--steps", type=int, default=7, help="settings per parameter")
-    parser.add_argument("--seeds", type=int, default=6, help="synthetic paths per setting")
+    parser.add_argument("--steps", type=int, default=15, help="settings per parameter")
+    parser.add_argument("--seeds", type=int, default=25, help="synthetic paths per setting")
     parser.add_argument("--bars", type=int, default=1000)
+    parser.add_argument("--alpha", type=float, default=0.05,
+                        help="tail probability for the noise comparison")
     parser.add_argument("--cash", type=float, default=10_000.0)
     args = parser.parse_args()
 
@@ -174,49 +266,64 @@ def main() -> int:
         print()
 
     # -- shape of the surface ------------------------------------------------
-    # The question here is SHAPE, not profit. On a random walk with costs the
-    # expected return of any strategy is negative, so "unprofitable" is the
-    # null result and says nothing. What synthetic data *can* answer is whether
-    # performance varies smoothly with a parameter or jumps around — and a
-    # parameter whose neighbours look nothing like it was fitted, not found.
+    # Two questions, kept separate. First: can this sweep resolve anything at
+    # all — is the variation between settings bigger than the sampling error
+    # within each one? Only if yes does the second question mean anything:
+    # is the surface rougher, or smoother, than pure noise would be?
     print("Sensitivity")
     print("-" * len(header))
     flags = []
-    roughness_by_param = {}
+    verdicts = {}
+    ratios = []
+    signals = []
 
     for name, default, results in findings:
         returns = [outcome["return"] for _, outcome in results]
+        per_seed = [outcome["per_seed"] for _, outcome in results]
         spread = max(returns) - min(returns)
-        median = statistics.median(returns)
+        count = len(returns)
 
-        # Mean step between adjacent settings, relative to the total range.
-        # A smooth curve over n points steps about 1/(n-1) of the range each
-        # time; an alternating surface steps the whole range every time.
         jaggedness = roughness(returns)
-        reference = smooth_reference(len(returns))
-        roughness_by_param[name] = jaggedness
+        between, within, ratio, true_between = resolving_power(per_seed)
+        ratios.append(ratio)
+        signals.append(true_between)
+        upper = null_percentile(count, 1.0 - args.alpha)
+        lower = null_percentile(count, args.alpha)
+        shape = classify_roughness(jaggedness, count, args.alpha)
 
         values = [v for v, _ in results]
         stands_alone, margin = is_peaked(values, returns, default)
 
-        verdict = "smooth"
         if spread < 1e-9:
-            # Changing the value moved nothing, so the parameter is not wired
-            # into this configuration — long-only strategies never read their
-            # short-side thresholds, for instance.
             verdict = "no effect"
             flags.append(
-                f"{name}: varying it changes nothing — inert in this configuration, "
-                "so it is not a tuned parameter but it is also not doing anything"
+                f"{name}: varying it changes nothing — inert in this configuration"
             )
-        elif jaggedness > 0.5:
-            verdict = "SPIKY"
+        elif ratio < 2.0:
+            # Point-to-point differences are the same size as the error on each
+            # point. Any shape read off this is an artefact of the seed count.
+            verdict = "UNRESOLVED"
             flags.append(
-                f"{name}: adjacent settings differ by {jaggedness:.0%} of the total range "
-                f"(a smooth curve would be about {reference:.0%}) — the surface is "
-                "jagged, so the configured value is not a stable choice"
+                f"{name}: between-point spread {between:.1%} is only {ratio:.1f}x the "
+                f"within-point standard error {within:.1%}; noise-corrected signal "
+                f"{true_between:.2%} — "
+                + ("there is no surface here to resolve, so more seeds will not help"
+                   if true_between < 1e-9 else
+                   "add seeds before reading anything into the shape")
             )
-        if stands_alone:
+        elif shape == "jagged":
+            verdict = "JAGGED"
+            flags.append(
+                f"{name}: roughness {jaggedness:.0%} exceeds the {1 - args.alpha:.0%} "
+                f"point of the noise distribution ({upper:.0%} at {count} settings) — "
+                "significantly more jagged than chance"
+            )
+        elif shape == "smooth":
+            verdict = "smooth"
+        else:
+            verdict = "noise"
+
+        if stands_alone and verdict not in {"UNRESOLVED", "no effect"}:
             verdict = "PEAKED"
             flags.append(
                 f"{name}: the configured value is the single best setting and beats the "
@@ -224,40 +331,54 @@ def main() -> int:
                 "that was tuned rather than found"
             )
 
+        verdicts[name] = verdict
         print(
-            f"{name:<16}{'':>9}{'range':>10} {spread:>7.1%}"
-            f"   roughness {jaggedness:>4.0%} (smooth ~{reference:.0%})   {verdict}"
+            f"{name:<16}{'':>9}{'rough':>10} {jaggedness:>6.0%}"
+            f"  noise[{lower:.0%}-{upper:.0%}]  resolve {ratio:>4.1f}x   {verdict}"
         )
 
     all_returns = [o["return"] for _, _, rs in findings for _, o in rs]
-    mean_roughness = statistics.mean(roughness_by_param.values())
+    median_ratio = statistics.median(ratios) if ratios else 0.0
+    resolved = [n for n, v in verdicts.items() if v not in {"UNRESOLVED", "no effect"}]
 
     print("\nVerdict")
     print("-" * len(header))
     print(f"  settings tested        : {len(all_returns)}")
+    print(f"  points x seeds         : {args.steps} x {args.seeds}")
+    median_signal = statistics.median(signals) if signals else 0.0
+    print(f"  median resolving power : {median_ratio:.1f}x "
+          f"(between-point spread / within-point standard error; >2 to read anything)")
+    print(f"  median true signal     : {median_signal:.2%} "
+          "(noise-corrected between-point spread)")
+    print(f"  parameters resolved    : {len(resolved)}/{len(verdicts)}")
     print(f"  median across sweep    : {statistics.median(all_returns):+.1%}")
     print(f"  baseline               : {baseline['return']:+.1%}")
-    print(f"  baseline percentile    : "
-          f"{sum(1 for r in all_returns if r < baseline['return']) / len(all_returns):.0%}")
-    print(f"  mean roughness         : {mean_roughness:.0%} "
-          f"(smooth is near {1.0 / (args.steps - 1):.0%}, jagged approaches 100%)")
 
     if flags:
         print("\n  Flags:")
         for flag in flags:
             print(f"    - {flag}")
 
-    if mean_roughness > 0.5:
-        print("\n  JAGGED surface. Results jump between neighbouring settings, so the")
-        print("  configured values are not meaningfully better than their neighbours —")
-        print("  they are a draw from noise. Treat the parameters as unvalidated.")
-    elif flags:
-        print("\n  MOSTLY SMOOTH, with the flagged parameters looking tuned. Widen or")
-        print("  remove those before trusting the configuration.")
+    if not resolved:
+        print("\n  NO RESOLVING POWER. Every parameter's surface is within sampling")
+        print("  noise, so the sweep supports no conclusion about shape either way.")
+        if median_signal < 1e-9:
+            print("  The noise-corrected signal is zero: the surface is genuinely flat,")
+            print("  which is what a random walk should produce — it has no structure")
+            print("  for a parameter to exploit. More seeds will NOT help, because")
+            print("  there is no signal to resolve. Only real data can answer this.")
+        else:
+            print("  Raise --seeds and --steps and re-run.")
+    elif any(v in {"JAGGED", "PEAKED"} for v in verdicts.values()):
+        print("\n  TUNED-LOOKING parameters found. The flagged ones are significantly")
+        print("  rougher than noise or sit on isolated peaks; widen or remove them.")
+    elif all(verdicts[n] == "noise" for n in resolved):
+        print("\n  INDISTINGUISHABLE FROM NOISE. Nothing looks overfit, but nothing")
+        print("  looks structured either — the surface is flat within measurement")
+        print("  error, which is the expected result on a random walk.")
     else:
-        print("\n  SMOOTH surface. Performance changes gradually in every direction and")
-        print("  the configured values are not isolated peaks. That is consistent with")
-        print("  parameters that were chosen rather than fitted.")
+        print("\n  SMOOTH. Resolved parameters vary gradually and none is an isolated")
+        print("  peak, which is what a non-overfit parameter set looks like.")
 
     print("\n  Note: near-zero or negative returns above are the EXPECTED result on a")
     print("  random walk, where there is no structure to exploit and costs are real.")

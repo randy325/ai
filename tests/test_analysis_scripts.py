@@ -8,6 +8,8 @@ construction.
 
 import importlib.util
 import io
+import random
+import statistics
 import sys
 import tempfile
 import unittest
@@ -64,6 +66,125 @@ class TestRoughness(unittest.TestCase):
 
     def test_smooth_reference_shrinks_with_more_points(self):
         self.assertGreater(sweep.smooth_reference(3), sweep.smooth_reference(11))
+
+
+class TestNullCalibration(unittest.TestCase):
+    """The threshold must come from the noise distribution, not a constant.
+
+    Simulating roughness under iid random values shows the statistic's null is
+    strongly dependent on the point count: mean about 0.67 at 3 points falling
+    to 0.28 at 31. A fixed 0.5 cutoff therefore sat on the noise *mean* for a
+    5-point sweep, flagging pure noise as SPIKY roughly half the time.
+    """
+
+    def test_the_null_mean_falls_as_points_increase(self):
+        means = [statistics.mean(sweep.null_roughness(n, trials=4000)) for n in (5, 11, 21)]
+        self.assertGreater(means[0], means[1])
+        self.assertGreater(means[1], means[2])
+
+    def test_the_five_point_null_matches_the_reported_simulation(self):
+        values = sweep.null_roughness(5, trials=20_000)
+        self.assertAlmostEqual(statistics.mean(values), 0.49, delta=0.03)
+        self.assertAlmostEqual(sweep.null_percentile(5, 0.05), 0.30, delta=0.03)
+        self.assertAlmostEqual(sweep.null_percentile(5, 0.95), 0.70, delta=0.03)
+
+    def test_the_old_constant_threshold_was_a_coin_flip_at_five_points(self):
+        values = sweep.null_roughness(5, trials=20_000)
+        false_positive = sum(1 for v in values if v > 0.5) / len(values)
+        self.assertGreater(false_positive, 0.30,
+                           "a fixed 0.5 cutoff fires on pure noise far too often")
+
+    def test_the_calibrated_threshold_holds_its_error_rate(self):
+        # By construction the p95 cutoff should fire on ~5% of pure noise, at
+        # every point count — which the constant threshold did not.
+        for count in (5, 7, 11, 15, 21):
+            values = sweep.null_roughness(count, trials=20_000)
+            cutoff = sweep.null_percentile(count, 0.95)
+            rate = sum(1 for v in values if v > cutoff) / len(values)
+            self.assertAlmostEqual(rate, 0.05, delta=0.01, msg=f"count={count}")
+
+    def test_the_null_is_deterministic(self):
+        self.assertEqual(sweep.null_roughness(7, trials=500),
+                         sweep.null_roughness(7, trials=500))
+
+    def test_classification_is_three_way(self):
+        # Above the upper tail, below the lower tail, and the large middle
+        # where the statistic simply cannot tell.
+        self.assertEqual(sweep.classify_roughness(0.99, 11), "jagged")
+        self.assertEqual(sweep.classify_roughness(0.05, 11), "smooth")
+        self.assertEqual(
+            sweep.classify_roughness(statistics.median(sweep.null_roughness(11)), 11),
+            "noise",
+        )
+
+    def test_the_previously_flagged_oversold_value_is_only_noise(self):
+        # rsi-mean-reversion's oversold measured 0.63 over 5 settings and was
+        # labelled SPIKY. The 5-point null's 95th percentile is about 0.70.
+        self.assertEqual(sweep.classify_roughness(0.63, 5), "noise")
+
+
+class TestResolvingPower(unittest.TestCase):
+    """Between-point signal must be separated from within-point sampling noise."""
+
+    def test_identical_noisy_points_have_no_resolving_power(self):
+        rng = random.Random(1)
+        per_seed = [[rng.gauss(0.0, 0.10) for _ in range(20)] for _ in range(9)]
+        _, _, ratio, _ = sweep.resolving_power(per_seed)
+        self.assertLess(ratio, 2.0, "a flat surface must not appear resolvable")
+
+    def test_a_strong_trend_resolves(self):
+        rng = random.Random(2)
+        per_seed = [
+            [i * 0.10 + rng.gauss(0.0, 0.01) for _ in range(20)] for i in range(9)
+        ]
+        _, _, ratio, _ = sweep.resolving_power(per_seed)
+        self.assertGreater(ratio, 2.0)
+
+    def test_more_seeds_increase_resolving_power(self):
+        def ratio_for(seed_count):
+            rng = random.Random(3)
+            per_seed = [
+                [i * 0.02 + rng.gauss(0.0, 0.10) for _ in range(seed_count)]
+                for i in range(9)
+            ]
+            return sweep.resolving_power(per_seed)[2]
+
+        self.assertGreater(ratio_for(100), ratio_for(4))
+
+    def test_degenerate_input_is_safe(self):
+        self.assertEqual(sweep.resolving_power([]), (0.0, 0.0, 0.0, 0.0))
+        self.assertEqual(sweep.resolving_power([[0.1]]), (0.0, 0.0, 0.0, 0.0))
+
+    def test_a_flat_surface_has_zero_noise_corrected_signal(self):
+        # Every point shares one true value; the medians still scatter, and the
+        # correction must recognise that scatter as noise rather than shape.
+        rng = random.Random(9)
+        per_seed = [[rng.gauss(0.0, 0.10) for _ in range(30)] for _ in range(11)]
+        *_, true_between = sweep.resolving_power(per_seed)
+        self.assertLess(true_between, 0.01)
+
+    def test_a_real_surface_survives_the_correction(self):
+        rng = random.Random(10)
+        per_seed = [[i * 0.10 + rng.gauss(0.0, 0.02) for _ in range(30)] for i in range(11)]
+        *_, true_between = sweep.resolving_power(per_seed)
+        self.assertGreater(true_between, 0.20)
+
+    def test_more_seeds_do_not_manufacture_signal_from_a_flat_surface(self):
+        # The decisive property: on a flat surface the ratio does not improve
+        # with seed count, because between and within shrink together.
+        def ratio_for(k):
+            rng = random.Random(11)
+            return sweep.resolving_power(
+                [[rng.gauss(0.0, 0.10) for _ in range(k)] for _ in range(11)]
+            )[2]
+        self.assertLess(ratio_for(400), 2.0)
+        self.assertLess(ratio_for(25), 2.0)
+
+    def test_within_point_error_shrinks_with_seed_count(self):
+        rng = random.Random(4)
+        few = [[rng.gauss(0.0, 0.1) for _ in range(4)] for _ in range(6)]
+        many = [[rng.gauss(0.0, 0.1) for _ in range(64)] for _ in range(6)]
+        self.assertGreater(sweep.resolving_power(few)[1], sweep.resolving_power(many)[1])
 
 
 class TestPeakDetection(unittest.TestCase):

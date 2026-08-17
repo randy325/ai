@@ -88,14 +88,25 @@ class RSIMeanReversion(Strategy):
     for anyone tuning later, so passing it without shorting is an error rather
     than a no-op.
 
-    **Sweep stability.** A ±30% parameter sweep on synthetic data (see
-    ``scripts/robustness_sweep.py``) reports ``oversold`` as SPIKY: adjacent
-    settings differ by about 63% of the sweep's total range, where a smooth
-    curve would show roughly 25%. Neighbouring values of ``oversold`` therefore
-    tell you very little about the configured one, so treat 30.0 as an
-    arbitrary pick rather than a tuned optimum, and re-check it on real data
-    before relying on it. ``period`` and ``exit_level`` are smooth by the same
-    measure.
+    **Sweep stability: no measurement available.** An earlier note here
+    reported ``oversold`` as having a SPIKY parameter surface, at 63% roughness
+    against a 25% reference. That finding is **retracted**. The threshold it
+    used was a hardcoded 0.5, which sits on the *mean* of the statistic's null
+    distribution for a five-point sweep — pure noise scores 0.49 on average and
+    exceeds 0.5 about 42% of the time, so the label carried no information. The
+    63% reading falls below the 95th percentile of that null (about 0.70) and
+    was a false positive.
+
+    Recalibrated against the null and run at 15 settings x 25 seeds, every
+    parameter of every strategy here comes back UNRESOLVED: the spread between
+    settings is smaller than the sampling error within them. Escalating to 400
+    seeds does not help, because the noise-corrected signal is zero — a
+    geometric random walk has no parameter-dependent structure for a sweep to
+    find, so there is nothing to resolve at any sample size.
+
+    The practical consequence: synthetic data cannot validate these thresholds
+    in either direction. Treat 30.0 as an untested default, and run
+    ``scripts/robustness_sweep.py`` against real bars if you need an answer.
     """
 
     name = "rsi-mean-reversion"
