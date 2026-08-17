@@ -8,8 +8,10 @@ see ``docs/going-live.md`` for what a live adapter would have to add.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from typing import Callable
 
 from .instruments import EQUITY, InstrumentSpec
 from .models import (
@@ -87,13 +89,32 @@ class OrderGuard:
     enabled: bool = True
 
     def check(
-        self, order: Order, price: float, candle: Candle, broker: "PaperBroker"
+        self,
+        order: Order,
+        price: float,
+        candle: Candle,
+        broker: "PaperBroker",
+        increasing_quantity: float | None = None,
     ) -> tuple[bool, str]:
+        """Vet an order. ``increasing_quantity`` is the part that adds exposure.
+
+        Every check here exists to stop the bot *taking* risk it did not mean
+        to. None of them should ever stop it shedding risk: a guard that can
+        block an exit turns a bad tick into a position you cannot leave, and
+        turns the kill switch into a suggestion. So a reduce-only order — one
+        that only moves the position toward zero — is exempt outright, and a
+        reversal is judged on its opening leg alone.
+        """
         if not self.enabled:
             return True, ""
 
         if price <= 0:
             return False, f"non-positive price {price}"
+
+        if increasing_quantity is None:
+            increasing_quantity = order.quantity
+        if increasing_quantity <= 1e-9:
+            return True, ""
 
         last = broker.last_price(order.symbol)
         if last and last > 0:
@@ -106,10 +127,10 @@ class OrderGuard:
 
         equity = broker.equity()
         if equity > 0:
-            notional = order.quantity * price
+            notional = increasing_quantity * price
             if notional > equity * self.max_order_fraction:
                 return False, (
-                    f"order notional {notional:,.2f} exceeds "
+                    f"new exposure {notional:,.2f} exceeds "
                     f"{self.max_order_fraction:.1f}x equity {equity:,.2f}"
                 )
 
@@ -148,6 +169,17 @@ class PaperBroker:
     max_leverage: float = 1.0
     spec: InstrumentSpec = field(default_factory=lambda: EQUITY)
     guard: OrderGuard = field(default_factory=OrderGuard)
+    #: TEST ONLY. Called with (order, candle) before execution; returning a
+    #: string rejects the order as RejectionKind.VENUE. Nothing in the package
+    #: sets this — the paper broker has no venue to be refused by — so it
+    #: exists to make the circuit-breaker path reachable in tests instead of
+    #: leaving it dead until a live adapter appears.
+    fault_injector: "Callable[[Order, Candle], str | None] | None" = None
+    #: How many order results and rejections to retain. A continuously running
+    #: session would otherwise keep every client_order_id it ever saw. Old ids
+    #: fall out of the duplicate window, which is the accepted trade: a retry
+    #: arrives within seconds, not thousands of orders later.
+    history_limit: int = 10_000
 
     def __post_init__(self) -> None:
         if self.starting_cash <= 0:
@@ -168,12 +200,14 @@ class PaperBroker:
         self.fills: list[Fill] = []
         self.trades: list[Trade] = []
         self.total_commission: float = 0.0
-        self.rejections: list[tuple[datetime, str]] = []
+        self.rejections: "deque[tuple[datetime, str]]" = deque(maxlen=self.history_limit)
         self.halted: bool = False
         self.halt_reason: str = ""
         self._marks: dict[str, float] = {}
         self._open_trades: dict[str, _OpenTrade] = {}
-        self._results: dict[str, OrderResult] = {}
+        self._results: "OrderedDict[str, OrderResult]" = OrderedDict()
+        if self.history_limit < 1:
+            raise ValueError("history_limit must be at least 1")
 
     # -- kill switch ---------------------------------------------------------
 
@@ -235,9 +269,10 @@ class PaperBroker:
         if abs(self.cash - expected_cash) > tolerance:
             problems.append(f"cash {self.cash:.8f} but fills imply {expected_cash:.8f}")
 
-        equity = self.equity()
-        if abs(equity - (self.cash + self.market_value())) > tolerance:
-            problems.append("equity does not equal cash plus market value")
+        # No equity check here: equity() is *defined* as cash + market_value,
+        # so comparing the two can never fail. The cash and position checks
+        # above test the same invariant against the fill ledger, which is an
+        # independent source and can actually disagree.
 
         commission = sum(f.commission for f in self.fills)
         if abs(commission - self.total_commission) > tolerance:
@@ -292,6 +327,12 @@ class PaperBroker:
 
     # -- execution -----------------------------------------------------------
 
+    def _remember(self, result: OrderResult) -> None:
+        """Latch a fill against its id, evicting the oldest when full."""
+        self._results[result.order.client_order_id] = result
+        while len(self._results) > self.history_limit:
+            self._results.popitem(last=False)
+
     def _reject(
         self,
         order: Order,
@@ -303,7 +344,11 @@ class PaperBroker:
         result = OrderResult(
             order, OrderStatus.REJECTED, reason=reason, rejection_kind=kind
         )
-        self._results[order.client_order_id] = result
+        # Deliberately NOT latched. Idempotency exists to stop a fill happening
+        # twice; a rejection produced no position, so replaying the same id
+        # must be allowed. Latching it meant a limit order that missed a single
+        # bar, or anything refused during a halt, was dead for the rest of the
+        # session even after resume().
         # Rejections after a halt are the kill switch working as intended, so
         # they log at debug; anything else is a real refusal worth surfacing.
         logger.log(
@@ -343,10 +388,16 @@ class PaperBroker:
                 filled_quantity=previous.filled_quantity,
                 fill=previous.fill,
                 reason=f"already {previous.status.value}",
+                rejection_kind=previous.rejection_kind,
             )
 
         if order.quantity <= 0:
             return self._reject(order, candle, "non-positive quantity")
+
+        if self.fault_injector is not None:
+            injected = self.fault_injector(order, candle)
+            if injected:
+                return self._reject(order, candle, injected, RejectionKind.VENUE)
 
         reference = candle.close if reference_price is None else reference_price
         if order.type is OrderType.LIMIT:
@@ -361,7 +412,20 @@ class PaperBroker:
                 )
             reference = order.limit_price
 
-        price = float(self.spec.round_price(self.slippage.fill_price(order.side, reference, candle)))
+        price = self.slippage.fill_price(order.side, reference, candle)
+        if order.type is OrderType.LIMIT:
+            # Slippage may not carry a fill through its own limit: a buy limit
+            # is a ceiling and a sell limit a floor, by definition. Tick
+            # rounding is directional for the same reason — rounding a buy up
+            # to the nearest tick would step back over the limit.
+            if order.side is Side.BUY:
+                price = min(price, order.limit_price)
+                price = float(self.spec.round_price_down(price))
+            else:
+                price = max(price, order.limit_price)
+                price = float(self.spec.round_price_up(price))
+        else:
+            price = float(self.spec.round_price(price))
         position = self.position(order.symbol)
 
         if not self.allow_short:
@@ -369,7 +433,14 @@ class PaperBroker:
             if resulting < -1e-9:
                 return self._reject(order, candle, "shorting disabled")
 
-        allowed, guard_reason = self.guard.check(order, price, candle, self)
+        signed = order.side.sign * order.quantity
+        reducing = not position.is_flat and (signed > 0) != (position.quantity > 0)
+        closing_leg = min(order.quantity, abs(position.quantity)) if reducing else 0.0
+        increasing_leg = order.quantity - closing_leg
+
+        allowed, guard_reason = self.guard.check(
+            order, price, candle, self, increasing_quantity=increasing_leg
+        )
         if not allowed:
             return self._reject(order, candle, guard_reason)
 
@@ -410,7 +481,7 @@ class PaperBroker:
             fill=fill,
             reason=f"{shortfall:.8f} unfilled" if partial else "",
         )
-        self._results[order.client_order_id] = result
+        self._remember(result)
         if partial:
             logger.warning("partial fill: %s", result.describe())
         return result
@@ -434,9 +505,13 @@ class PaperBroker:
         if equity <= 0:
             return 0.0
 
+        # The closing leg moves this symbol's position toward zero, so it is
+        # ADDED with the order's sign. Subtracting it doubled the exposure the
+        # close was about to release, leaving no headroom for the opening leg
+        # of a reversal and silently trimming the flip to a flatten.
         gross_after_close = sum(
             abs(
-                (p.quantity - (order.side.sign * closing_quantity if s == order.symbol else 0.0))
+                (p.quantity + (order.side.sign * closing_quantity if s == order.symbol else 0.0))
                 * self._marks.get(s, p.average_price)
             )
             for s, p in self.positions.items()

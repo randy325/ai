@@ -434,7 +434,10 @@ class Ensemble(Strategy):
         slower copy of whatever just worked.
         """
         scores = self.scores
-        if not any(self._scores[0]):
+        # Every member, not just the first. Checking member 0 alone meant a
+        # leading member that happened to sit flat for the whole window forced
+        # equal weighting even when the others had strong scores.
+        if not any(any(s) for s in self._scores):
             return [1.0 / len(self.members)] * len(self.members)
 
         floor = 0.05

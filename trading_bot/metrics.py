@@ -103,10 +103,34 @@ def _returns(curve: list[EquityPoint]) -> list[float]:
     return out
 
 
+SECONDS_PER_YEAR = 365.25 * 86_400
+
+#: Below this much elapsed history, bar density is too noisy to trust and the
+#: spacing heuristic is used instead.
+MIN_SECONDS_FOR_DENSITY = 30 * 86_400
+
+
 def _bars_per_year(curve: list[EquityPoint]) -> float:
-    """Infer bar frequency from the median spacing of the equity curve."""
+    """How many bars this series actually contains per year.
+
+    Measured, not assumed. The previous version inferred a market from the
+    median gap, which forced every daily series to 252 bars a year and every
+    intraday one to a 6.5 hour session — understating a 24/7 crypto Sharpe by
+    about 17%, and a weekly series by treating 52 bars as 36.
+
+    Counting bars over elapsed time needs no such guess: a weekday-only series
+    lands near 252 on its own because the weekend gaps are already in the
+    elapsed time, and a continuous series lands near 365 for the same reason.
+    """
     if len(curve) < 3:
         return TRADING_DAYS_PER_YEAR
+
+    elapsed = (curve[-1].timestamp - curve[0].timestamp).total_seconds()
+    if elapsed >= MIN_SECONDS_FOR_DENSITY:
+        return (len(curve) - 1) * SECONDS_PER_YEAR / elapsed
+
+    # Too short to measure: fall back to spacing, but annualise on the calendar
+    # rather than assuming an equity session.
     gaps = sorted(
         (b.timestamp - a.timestamp).total_seconds()
         for a, b in zip(curve, curve[1:])
@@ -115,10 +139,7 @@ def _bars_per_year(curve: list[EquityPoint]) -> float:
     if not gaps:
         return TRADING_DAYS_PER_YEAR
     median = gaps[len(gaps) // 2]
-    if median >= 86_400:
-        # Daily or slower: count trading days, not calendar days.
-        return TRADING_DAYS_PER_YEAR * (86_400 / median)
-    return (TRADING_DAYS_PER_YEAR * 6.5 * 3600) / median
+    return SECONDS_PER_YEAR / median
 
 
 def max_drawdown(curve: list[EquityPoint]) -> tuple[float, int]:

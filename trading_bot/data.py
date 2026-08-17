@@ -23,8 +23,12 @@ _TIMESTAMP_FORMATS = (
     "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%d %H:%M",
     "%Y-%m-%d",
-    "%d/%m/%Y",
+    # Month-first first. Both orderings are guesses for a date like 03/04/2020,
+    # but day-first silently produced an interleaved sequence on US exports:
+    # day-first for days <= 12, month-first for >= 13. Preferring month-first
+    # at least fails consistently, and matches what Stooq and Yahoo emit.
     "%m/%d/%Y",
+    "%d/%m/%Y",
 )
 
 
@@ -135,11 +139,28 @@ class CSVFeed(DataFeed):
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"{self.path}:{line_number}: {exc}") from exc
 
-                if previous is not None and timestamp < previous:
-                    raise ValueError(
-                        f"{self.path}:{line_number}: timestamps must be chronological "
-                        f"({timestamp} follows {previous})"
-                    )
+                if previous is not None:
+                    try:
+                        out_of_order = timestamp < previous
+                        duplicated = timestamp == previous
+                    except TypeError as exc:
+                        # One row carried a zone and another did not; comparing
+                        # them raises a bare TypeError deep in the loop.
+                        raise ValueError(
+                            f"{self.path}:{line_number}: mixed timezone awareness — "
+                            f"{timestamp!r} and {previous!r} cannot be compared. "
+                            "Use one timestamp format throughout the file."
+                        ) from exc
+                    if duplicated:
+                        raise ValueError(
+                            f"{self.path}:{line_number}: duplicate timestamp {timestamp}; "
+                            "repeated bars inflate the bar count and the return series"
+                        )
+                    if out_of_order:
+                        raise ValueError(
+                            f"{self.path}:{line_number}: timestamps must be chronological "
+                            f"({timestamp} follows {previous})"
+                        )
                 previous = timestamp
 
                 # Clamp so a rounded high/low in the source can't fail validation.

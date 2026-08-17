@@ -187,13 +187,19 @@ class TestOrderIdentityAndIdempotency(unittest.TestCase):
         self.assertAlmostEqual(second.filled_quantity, 10.0)
         self.assertIn("already filled", second.reason)
 
-    def test_a_rejected_id_is_also_remembered(self):
+    def test_a_rejected_id_stays_retryable(self):
+        # Idempotency latches fills, never rejections. A rejection produced no
+        # position, so replaying the id must be allowed — otherwise a limit
+        # order that missed one bar is dead for the rest of the session.
         broker = clean_broker(allow_short=False)
         bar = candle(100.0)
         broker.mark(bar)
-        order = Order("X", Side.SELL, 5, client_order_id="nope")
+        order = Order("X", Side.SELL, 5)
         self.assertEqual(broker.submit(order, bar).status, OrderStatus.REJECTED)
-        self.assertEqual(broker.submit(order, bar).status, OrderStatus.DUPLICATE)
+
+        broker.allow_short = True
+        retry = broker.submit(order, bar)
+        self.assertTrue(retry.filled, "a rejected id must not be poisoned forever")
 
     def test_fill_carries_the_order_id(self):
         broker = clean_broker()

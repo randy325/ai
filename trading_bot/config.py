@@ -226,6 +226,7 @@ class RunConfig:
                 losing_streak=self.losing_streak,
                 recovery_wins=self.recovery_wins,
                 max_trades_per_day=self.max_trades_per_day,
+                starting_equity=self.starting_cash,
             )
         if self.risk_profile != "static":
             raise ValueError(

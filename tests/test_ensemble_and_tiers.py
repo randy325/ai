@@ -267,10 +267,15 @@ class TestTieredRiskManager(unittest.TestCase):
         self.assertAlmostEqual(m.peak_equity, 20_000)
 
     def test_tier_changes_are_recorded(self):
+        # An unseeded manager starts conservative — there is no basis for
+        # permissiveness before the account size is known — so the first
+        # observation promotes it to the tier the high-water mark justifies.
         m = self.make()
         m.observe(candle(day=1), 5_000)
         m.observe(candle(day=2), 20_000)
-        self.assertEqual(m.tier_changes, [("aggressive", "moderate")])
+        self.assertEqual(
+            m.tier_changes, [("conservative", "aggressive"), ("aggressive", "moderate")]
+        )
 
     def test_rejects_invalid_settings(self):
         with self.assertRaises(ValueError):

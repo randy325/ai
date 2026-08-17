@@ -61,7 +61,19 @@ class OrderStatus(str, Enum):
 
     @property
     def is_fill(self) -> bool:
-        return self in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)
+        """Whether the exchange holds a position because of this submission.
+
+        DUPLICATE counts. A caller retrying after an ambiguous failure needs to
+        learn that the original DID fill; reporting it as failure is what makes
+        the caller submit a fresh id and end up with the position twice — the
+        exact outcome idempotency exists to prevent. A duplicate of a rejection
+        carries a rejected status instead, so nothing is masked.
+        """
+        return self in (
+            OrderStatus.FILLED,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.DUPLICATE,
+        )
 
 
 @dataclass(frozen=True)

@@ -200,13 +200,19 @@ class RiskManager:
 
 @dataclass
 class RiskTier:
-    """One named risk posture the bot can switch between."""
+    """One named risk posture the bot can switch between.
+
+    ``rank`` orders tiers by permissiveness. It exists so the manager can ask
+    "is this a promotion?" without inspecting individual limits, which is what
+    makes the one-way ratchet enforceable.
+    """
 
     name: str
     max_position_fraction: float
     max_drawdown: float | None
     risk_per_trade: float = 0.02
     daily_loss_limit: float | None = None
+    rank: int = 0
 
     def to_limits(self, max_trades_per_day: int | None = None) -> RiskLimits:
         return RiskLimits(
@@ -218,29 +224,45 @@ class RiskTier:
         )
 
 
-AGGRESSIVE = RiskTier("aggressive", max_position_fraction=1.0, max_drawdown=0.35, risk_per_trade=0.04)
-MODERATE = RiskTier("moderate", max_position_fraction=0.95, max_drawdown=0.25, risk_per_trade=0.02)
+AGGRESSIVE = RiskTier(
+    "aggressive", max_position_fraction=1.0, max_drawdown=0.35, risk_per_trade=0.04, rank=2
+)
+MODERATE = RiskTier(
+    "moderate", max_position_fraction=0.95, max_drawdown=0.25, risk_per_trade=0.02, rank=1
+)
 CONSERVATIVE = RiskTier(
     "conservative",
     max_position_fraction=0.5,
     max_drawdown=0.15,
     risk_per_trade=0.01,
     daily_loss_limit=0.03,
+    rank=0,
 )
 
 
 class TieredRiskManager(RiskManager):
     """Switches risk posture with account size and recent results.
 
-    Below ``tier_threshold`` of equity the bot runs ``aggressive``; at or above
-    it, ``moderate`` — a small account can afford variance that a large one
-    cannot. A run of ``losing_streak`` consecutive losing trades overrides both
-    and drops to ``conservative`` until ``recovery_wins`` trades come back
-    green.
+    Selection keys on the account's **high-water mark**, not its current
+    equity. That distinction is the whole design. Keyed on current equity, a
+    £100k account that had crashed to £5k looked identical to one that started
+    at £5k, and got the aggressive tier for it — sizing up as it lost, which is
+    a martingale and the fastest route to zero. The high-water mark only ever
+    rises, so the tier can loosen when the account genuinely grows and never
+    because it shrank.
 
-    The demotion is deliberately easier than the promotion. Sizing up into a
-    losing streak is how an account with an edge still ends at zero, so the
-    ratchet is asymmetric on purpose.
+    Below ``tier_threshold`` of *peak* equity the bot runs ``aggressive``; at
+    or above it, ``moderate``. A small account really can afford variance a
+    large one cannot, and that intent survives intact. A run of
+    ``losing_streak`` consecutive losing trades overrides both and drops to
+    ``conservative`` until ``recovery_wins`` come back green.
+
+    Two rules make the ratchet one-way:
+
+    * the drawdown halt is evaluated against the limits already in force,
+      before any tier change, so switching tier can never un-halt a breach;
+    * a promotion is refused while equity sits below the high-water mark, so
+      loosening requires a new high rather than a bounce.
     """
 
     def __init__(
@@ -250,6 +272,7 @@ class TieredRiskManager(RiskManager):
         losing_streak: int = 3,
         recovery_wins: int = 2,
         max_trades_per_day: int | None = None,
+        starting_equity: float | None = None,
         aggressive: RiskTier = AGGRESSIVE,
         moderate: RiskTier = MODERATE,
         conservative: RiskTier = CONSERVATIVE,
@@ -267,7 +290,10 @@ class TieredRiskManager(RiskManager):
         self.moderate = moderate
         self.conservative = conservative
 
-        self.tier = aggressive
+        # Start at the tightest posture: until the account size is known there
+        # is no basis for permissiveness, and defaulting the other way means a
+        # brand-new manager runs its first bar at maximum risk.
+        self.tier = conservative
         self._demoted = False
         self._losses = 0
         self._wins = 0
@@ -275,13 +301,30 @@ class TieredRiskManager(RiskManager):
 
         super().__init__(self.tier.to_limits(max_trades_per_day), sizer)
 
-    def _select(self, equity: float) -> RiskTier:
+        if starting_equity is not None:
+            if starting_equity <= 0:
+                raise ValueError("starting_equity must be positive")
+            self.peak_equity = starting_equity
+            self._apply(self._select(), f"opening equity {starting_equity:,.0f}")
+
+    def _select(self) -> RiskTier:
+        """The tier the account's history justifies, ignoring current equity."""
         if self._demoted:
             return self.conservative
-        return self.aggressive if equity < self.tier_threshold else self.moderate
+        # The high-water mark, never the current balance: a drawdown must not
+        # be able to buy a bigger position size.
+        return self.aggressive if self.peak_equity < self.tier_threshold else self.moderate
 
-    def _apply(self, tier: RiskTier, why: str) -> None:
+    def _apply(self, tier: RiskTier, why: str, equity: float | None = None) -> None:
         if tier.name == self.tier.name:
+            return
+        if tier.rank > self.tier.rank and equity is not None and equity < self.peak_equity:
+            # Loosening requires a new high. A recovery that has not yet
+            # reclaimed the peak is not evidence that risk should go back up.
+            logger.info(
+                "holding %s: promotion to %s refused while %.0f is below peak %.0f",
+                self.tier.name, tier.name, equity, self.peak_equity,
+            )
             return
         self.tier_changes.append((self.tier.name, tier.name))
         logger.info("risk tier %s -> %s (%s)", self.tier.name, tier.name, why)
@@ -292,8 +335,11 @@ class TieredRiskManager(RiskManager):
         self.limits = tier.to_limits(self.max_trades_per_day)
 
     def observe(self, candle: Candle, equity: float) -> None:
-        self._apply(self._select(equity), f"equity {equity:,.0f}")
+        # Evaluate the halt against the limits already in force, THEN reselect.
+        # Reversing this let a tier change raise max_drawdown out from under a
+        # breach that had already happened.
         super().observe(candle, equity)
+        self._apply(self._select(), f"peak {self.peak_equity:,.0f}", equity=equity)
 
     def record_result(self, pnl: float) -> None:
         """Feed a closed trade's P&L in, so the tier can react to results."""

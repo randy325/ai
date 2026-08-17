@@ -201,8 +201,16 @@ class TradingEngine:
                         self.broker.kill(reason, candle)
                         warnings.append(f"circuit breaker: {reason}")
                 if result.filled:
+                    # Only a real success proves the venue is working, so this
+                    # is the single reset point. A risk or market rejection
+                    # leaves the streak alone rather than clearing it: the venue
+                    # has not answered either way.
                     self._consecutive_rejections = 0
-                if fill is not None:
+                # A DUPLICATE carries the *original* fill so the caller can see
+                # the position exists. Counting it again here would book one
+                # fill as two trades.
+                is_new_fill = fill is not None and result.status is not OrderStatus.DUPLICATE
+                if is_new_fill:
                     self.risk.record_trade()
                     # An adaptive risk layer needs the result of each round
                     # trip, not just that a fill happened.
@@ -255,10 +263,20 @@ class TradingEngine:
 
             allowed, block_reason = self.risk.can_trade()
             target = self.risk.target_notional(signal, equity, candle)
-            if not allowed and self.broker.position(candle.symbol).is_flat:
-                # Blocked and flat: nothing to do. Blocked while holding still
-                # allows the exit, since target_notional is already zero.
-                target = 0.0
+            if not allowed:
+                position = self.broker.position(candle.symbol)
+                if self.risk.halted or self.risk.paused:
+                    # A halt or a daily-loss pause is a decision to be out of
+                    # the market, so target zero and let the exit through.
+                    target = 0.0
+                else:
+                    # A throttle — the daily trade limit — means "place no more
+                    # orders today", not "liquidate". Targeting the position we
+                    # already hold produces no order at all. Previously the
+                    # target was only zeroed when already flat, so a blocked bot
+                    # holding a position still submitted a full reversal, giving
+                    # N+1 trades against a limit of N.
+                    target = position.quantity * candle.close
 
             order = self._rebalance_order(
                 candle.symbol,

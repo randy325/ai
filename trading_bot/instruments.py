@@ -14,7 +14,7 @@ and the exactness that matters is in what gets submitted.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal, InvalidOperation
 
 
 def _decimal(value: float | str | Decimal) -> Decimal:
@@ -82,6 +82,16 @@ class InstrumentSpec:
         except InvalidOperation as exc:  # pragma: no cover - absurd inputs only
             raise ValueError(f"cannot quantise price {price!r}") from exc
         return ticks * self.tick_size
+
+    def round_price_down(self, price: float | Decimal) -> Decimal:
+        """Snap a price down to a tick, so a clamped buy limit stays under it."""
+        value = _decimal(price)
+        return (value / self.tick_size).to_integral_value(rounding=ROUND_DOWN) * self.tick_size
+
+    def round_price_up(self, price: float | Decimal) -> Decimal:
+        """Snap a price up to a tick, so a clamped sell limit stays above it."""
+        value = _decimal(price)
+        return (value / self.tick_size).to_integral_value(rounding=ROUND_UP) * self.tick_size
 
     def round_quantity(self, quantity: float | Decimal) -> Decimal:
         """Snap a quantity down to a whole lot.
