@@ -261,6 +261,27 @@ class TestLiveCLI(unittest.TestCase):
         # A live session must not liquidate just because the loop stopped.
         self.assertIn("Open position", out)
 
+    def test_open_position_is_reported_with_unrealised_pnl(self):
+        # Trade stats count closed round trips only, so a session ending on an
+        # open winner shows the gain in equity and nothing in the win rate.
+        code, out, _ = self.run_cli(
+            ["paper", "--provider", "mock", "--symbol", "MOCK", "--interval", "1m",
+             "--strategy", "buy-and-hold", "--warmup", "20", "--max-bars", "4",
+             "--speed", "500000"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Open position", out)
+        self.assertIn("unrealised", out)
+
+    def test_report_is_shown_even_with_no_closed_trades(self):
+        code, out, _ = self.run_cli(
+            ["paper", "--provider", "mock", "--symbol", "MOCK", "--interval", "1m",
+             "--strategy", "buy-and-hold", "--warmup", "20", "--max-bars", "4",
+             "--speed", "500000"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Live paper session", out)
+
     def test_paper_emits_one_row_per_live_bar(self):
         code, out, _ = self.run_cli(
             ["paper", "--provider", "mock", "--symbol", "MOCK", "--interval", "1m",

@@ -406,7 +406,10 @@ def cmd_paper(args: argparse.Namespace) -> int:
     print(f"{'time':<17}{'close':>12}{'equity':>14}{'target':>8}  signal")
     print("-" * 78)
 
+    last_close: list[float | None] = [None]
+
     def on_bar(candle, signal, equity):
+        last_close[0] = candle.close
         # Warmup bars are history; only narrate what is happening now.
         if feed.live_bars == 0:
             return
@@ -434,9 +437,19 @@ def cmd_paper(args: argparse.Namespace) -> int:
     print(f"\nFinal equity ${broker.equity():,.2f} "
           f"({broker.equity() / config.starting_cash - 1:+.2%})")
     position = broker.position(config.symbol)
+    open_position = ""
     if not position.is_flat:
-        print(f"Open position: {position.quantity:+,.6f} @ {position.average_price:,.4f}")
-    if result is not None and result.trades:
+        open_position = f"{position.quantity:+,.6f} @ {position.average_price:,.4f}"
+        if last_close[0] is not None:
+            open_position += f" (unrealised {position.unrealized_pnl(last_close[0]):+,.2f})"
+        print(f"Open position: {open_position}")
+
+    if result is not None and (result.trades or open_position):
+        # Trade statistics count closed round trips only, so a session that
+        # ends holding a winner shows the return in equity and nothing in the
+        # win rate. Surfacing the open position keeps the two reconcilable.
+        if open_position:
+            result.metrics.extras["open_position"] = open_position
         print(result.metrics.format_report(f"Live paper session: {config.symbol}"))
     _warn_if_mock(config.provider)
     return 0
