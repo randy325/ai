@@ -80,6 +80,22 @@ class RSIMeanReversion(Strategy):
     Entry is at ``oversold``; the position is held until the RSI recovers past
     ``exit_level``, which avoids the whipsaw of exiting the moment it ticks
     back above the entry threshold.
+
+    ``overbought`` applies to short entries only, so it is accepted only when
+    ``allow_short`` is set. There is no coherent long-only role for it — a long
+    exits at ``exit_level`` on the way up, well before the RSI could reach an
+    overbought reading — and a parameter that silently does nothing is a trap
+    for anyone tuning later, so passing it without shorting is an error rather
+    than a no-op.
+
+    **Sweep stability.** A ±30% parameter sweep on synthetic data (see
+    ``scripts/robustness_sweep.py``) reports ``oversold`` as SPIKY: adjacent
+    settings differ by about 63% of the sweep's total range, where a smooth
+    curve would show roughly 25%. Neighbouring values of ``oversold`` therefore
+    tell you very little about the configured one, so treat 30.0 as an
+    arbitrary pick rather than a tuned optimum, and re-check it on real data
+    before relying on it. ``period`` and ``exit_level`` are smooth by the same
+    measure.
     """
 
     name = "rsi-mean-reversion"
@@ -88,12 +104,23 @@ class RSIMeanReversion(Strategy):
         self,
         period: int = 14,
         oversold: float = 30.0,
-        overbought: float = 70.0,
+        overbought: float | None = None,
         exit_level: float = 50.0,
         allow_short: bool = False,
     ) -> None:
-        if not 0 < oversold < exit_level < overbought < 100:
-            raise ValueError("thresholds must satisfy 0 < oversold < exit_level < overbought < 100")
+        if overbought is not None and not allow_short:
+            raise ValueError(
+                "overbought only governs short entries and does nothing in "
+                "long-only mode; pass allow_short=True or leave it unset"
+            )
+        if allow_short and overbought is None:
+            overbought = 70.0
+
+        if not 0 < oversold < exit_level < 100:
+            raise ValueError("thresholds must satisfy 0 < oversold < exit_level < 100")
+        if overbought is not None and not exit_level < overbought < 100:
+            raise ValueError("thresholds must satisfy exit_level < overbought < 100")
+
         self.rsi = RSI(period)
         self.oversold = oversold
         self.overbought = overbought
@@ -102,9 +129,11 @@ class RSIMeanReversion(Strategy):
         self._target = 0.0
 
     def describe(self) -> str:
+        # overbought is omitted when long-only, where it has no meaning.
+        short = f", overbought={self.overbought}" if self.overbought is not None else ""
         return (
-            f"{self.name}(period={self.rsi.period}, oversold={self.oversold}, "
-            f"overbought={self.overbought}, exit={self.exit_level})"
+            f"{self.name}(period={self.rsi.period}, oversold={self.oversold}"
+            f"{short}, exit={self.exit_level})"
         )
 
     def on_candle(self, candle: Candle) -> Signal:
@@ -116,7 +145,7 @@ class RSIMeanReversion(Strategy):
             if rsi <= self.oversold:
                 self._target = 1.0
                 return Signal(1.0, reason=f"RSI {rsi:.1f} oversold")
-            if self.allow_short and rsi >= self.overbought:
+            if self.allow_short and self.overbought is not None and rsi >= self.overbought:
                 self._target = -1.0
                 return Signal(-1.0, reason=f"RSI {rsi:.1f} overbought")
             return FLAT

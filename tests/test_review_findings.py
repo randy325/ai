@@ -737,3 +737,75 @@ class TestFinding15EnsembleWeightingDisablesItself(unittest.TestCase):
         weights = e.weights()
         self.assertGreater(weights[1], weights[0],
                            "a flat member 0 must not force equal weighting")
+
+
+class TestInertOverboughtParameter(unittest.TestCase):
+    """A parameter that silently does nothing is a trap for future tuning.
+
+    ``overbought`` is read only on the short entry, so in the default
+    long-only configuration it can be set to anything with no effect — the
+    robustness sweep flagged it as "no effect" for exactly this reason. It
+    cannot simply be deleted: long/short mode genuinely needs it. So setting
+    it where it would do nothing is now an error rather than a silent no-op.
+    """
+
+    def strategy(self, **kwargs):
+        from trading_bot.strategy import RSIMeanReversion
+        return RSIMeanReversion(**kwargs)
+
+    def test_setting_it_long_only_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.strategy(overbought=70.0)
+        self.assertIn("allow_short", str(ctx.exception))
+
+    def test_long_only_construction_without_it_is_fine(self):
+        s = self.strategy()
+        self.assertIsNone(s.overbought)
+
+    def test_long_only_describe_omits_it(self):
+        self.assertNotIn("overbought", self.strategy().describe())
+
+    def test_it_is_required_and_used_when_shorting(self):
+        s = self.strategy(allow_short=True)
+        self.assertIsNotNone(s.overbought, "short entries need a threshold")
+        self.assertIn("overbought", s.describe())
+
+    def test_an_explicit_value_works_when_shorting(self):
+        s = self.strategy(allow_short=True, overbought=85.0)
+        self.assertAlmostEqual(s.overbought, 85.0)
+        self.assertIn("85", s.describe())
+
+    def test_threshold_ordering_is_still_validated_when_shorting(self):
+        with self.assertRaises(ValueError):
+            self.strategy(allow_short=True, oversold=60, exit_level=50, overbought=70)
+        with self.assertRaises(ValueError):
+            self.strategy(allow_short=True, exit_level=80, overbought=70)
+
+    def test_shorting_still_triggers_on_the_threshold(self):
+        from trading_bot.models import Signal
+        s = self.strategy(period=5, allow_short=True, overbought=70.0)
+        start = datetime(2020, 6, 1)
+        price = 100.0
+        targets = []
+        for i in range(30):
+            previous, price = price, price + 2
+            targets.append(
+                s.on_candle(Candle(start + timedelta(days=i), previous,
+                                   max(previous, price), min(previous, price),
+                                   price, 100, "X")).target
+            )
+        self.assertIn(-1.0, targets)
+
+    def test_the_sweep_no_longer_reports_it_as_inert(self):
+        import importlib.util
+        from pathlib import Path as P
+        repo = P(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "rs", repo / "scripts" / "robustness_sweep.py"
+        )
+        sweep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sweep)
+        params = sweep.current_parameters("rsi-mean-reversion")
+        self.assertNotIn("overbought", params,
+                         "a parameter with no effect in this mode must not be swept")
+        self.assertIn("oversold", params)

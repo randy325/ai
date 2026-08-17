@@ -87,7 +87,9 @@ class TestSMACrossover(unittest.TestCase):
 class TestRSIMeanReversion(unittest.TestCase):
     def test_rejects_inconsistent_thresholds(self):
         with self.assertRaises(ValueError):
-            RSIMeanReversion(oversold=60, exit_level=50, overbought=70)
+            RSIMeanReversion(oversold=60, exit_level=50)
+        with self.assertRaises(ValueError):
+            RSIMeanReversion(allow_short=True, oversold=60, exit_level=50, overbought=70)
 
     def test_buys_after_a_sustained_selloff(self):
         signals = run(RSIMeanReversion(period=5), [200 - i * 2 for i in range(30)])
