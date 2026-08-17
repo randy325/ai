@@ -478,6 +478,22 @@ alone and understate the true range, which flatters any stop-based strategy.
 Rows must be chronological; the loader rejects out-of-order dates rather than
 sorting them, because a shuffled file usually means two series got concatenated.
 
+Slash dates are resolved **per file**, not per row. `03/04/2024` is 3 April in
+most of the world and 4 March in the US, so one row with a field above 12
+settles the whole column. A file where every row is ambiguous — a monthly
+series dated the 1st, for instance — is rejected rather than guessed:
+
+```
+eu.csv: every slash date in this file has both fields <= 12, so day-first and
+month-first are equally consistent with it. Pass date_order='day-first' or
+'month-first' explicitly — guessing would silently shift every bar
+```
+
+Deciding per row is what makes this dangerous: a European file would read days
+1–12 as months and 13–31 correctly, interleaving two calendars, and a monthly
+series dated the 1st would collapse into twelve consecutive days of January —
+ascending, so the chronological check never fires. ISO dates sidestep it.
+
 Note that `.gitignore` excludes `data/` and `*.csv`, so exported bars stay out
 of the repository.
 

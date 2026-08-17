@@ -49,7 +49,13 @@ or Yahoo works unmodified:
 
 Rows must be in chronological order; the loader rejects out-of-order dates
 rather than silently sorting, because a shuffled file usually means two
-different series were concatenated."""
+different series were concatenated.
+
+Slash dates (03/04/2024) are resolved per file, not per row: one row with a
+field above 12 settles the whole column. A file where every row is ambiguous —
+a monthly series dated the 1st, say — is rejected rather than guessed, because
+guessing wrong shifts every bar silently. Pass an explicit order in that case;
+ISO dates avoid the question entirely."""
 
 
 # A deliberate spread of regimes. Trend, chop and drawdown are different

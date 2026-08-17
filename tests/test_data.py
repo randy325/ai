@@ -260,9 +260,12 @@ class TestSpreadsheetExportFormats(unittest.TestCase):
         from trading_bot.data import parse_timestamp
         self.assertEqual(parse_timestamp("3/4/2024 16:00:00"), datetime(2024, 3, 4, 16, 0))
 
-    def test_an_unambiguous_day_first_datetime_still_parses(self):
+    def test_a_day_first_datetime_needs_the_day_first_order(self):
         from trading_bot.data import parse_timestamp
-        self.assertEqual(parse_timestamp("25/12/2024 16:00:00"), datetime(2024, 12, 25, 16, 0))
+        self.assertEqual(
+            parse_timestamp("25/12/2024 16:00:00", date_order="day-first"),
+            datetime(2024, 12, 25, 16, 0),
+        )
 
     def test_a_full_googlefinance_export_loads(self):
         import tempfile
@@ -270,13 +273,105 @@ class TestSpreadsheetExportFormats(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "spy.csv"
             path.write_text(
+                # A real export spans months, so some row disambiguates the
+                # ordering. Three rows all <= 12 would be genuinely ambiguous
+                # and are now rejected rather than guessed.
                 "Date,Open,High,Low,Close,Volume\n"
                 "1/2/2024 16:00:00,472.16,473.67,470.49,472.65,123963000\n"
                 "1/3/2024 16:00:00,470.43,471.19,468.17,468.79,103800800\n"
-                "1/4/2024 16:00:00,468.3,470.96,467.05,467.28,84232200\n",
+                "1/16/2024 16:00:00,468.3,470.96,467.05,467.28,84232200\n",
                 encoding="utf-8",
             )
             candles = list(CSVFeed(path))
         self.assertEqual(len(candles), 3)
         self.assertAlmostEqual(candles[0].close, 472.65)
         self.assertAlmostEqual(candles[-1].volume, 84232200)
+
+
+class TestSlashDateOrderIsResolvedPerFile(unittest.TestCase):
+    """Slash-date ordering is a property of the file, not of a row.
+
+    With both orderings in one per-row fallback list, month-first did not
+    "fail consistently": it succeeded WRONGLY on days 1-12 and fell through
+    correctly on 13-31, interleaving two calendars in one column.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def write(self, rows, name="p.csv"):
+        path = self.dir / name
+        path.write_text("Date,Close\n" + "".join(f"{d},{c}\n" for d, c in rows), encoding="utf-8")
+        return path
+
+    def test_a_european_daily_file_is_not_interleaved(self):
+        from trading_bot.data import CSVFeed
+        path = self.write([("01/04/2024", 100), ("02/04/2024", 101), ("15/04/2024", 102)])
+        dates = [c.timestamp.date() for c in CSVFeed(path)]
+        self.assertEqual([d.month for d in dates], [4, 4, 4],
+                         "one row above 12 settles the whole file as day-first")
+        self.assertEqual([d.day for d in dates], [1, 2, 15])
+
+    def test_a_us_daily_file_is_read_month_first(self):
+        from trading_bot.data import CSVFeed
+        path = self.write([("04/01/2024", 100), ("04/02/2024", 101), ("04/15/2024", 102)])
+        dates = [c.timestamp.date() for c in CSVFeed(path)]
+        self.assertEqual([d.month for d in dates], [4, 4, 4])
+        self.assertEqual([d.day for d in dates], [1, 2, 15])
+
+    def test_a_european_monthly_series_raises_instead_of_corrupting(self):
+        # The silent case: twelve bars dated the 1st parse as twelve
+        # consecutive days of January, ascending, so no ordering check fires.
+        from trading_bot.data import AmbiguousDateOrder, CSVFeed
+        path = self.write([(f"01/{m:02d}/2024", 100 + m) for m in range(1, 13)])
+        with self.assertRaises(AmbiguousDateOrder) as ctx:
+            list(CSVFeed(path))
+        self.assertIn("date_order", str(ctx.exception))
+
+    def test_an_explicit_order_resolves_the_ambiguous_case(self):
+        from trading_bot.data import CSVFeed
+        path = self.write([(f"01/{m:02d}/2024", 100 + m) for m in range(1, 13)])
+        dates = [c.timestamp.date() for c in CSVFeed(path, date_order="day-first")]
+        self.assertEqual([d.month for d in dates], list(range(1, 13)))
+        self.assertTrue(all(d.day == 1 for d in dates))
+
+    def test_the_wrong_explicit_order_is_honoured_not_second_guessed(self):
+        from trading_bot.data import CSVFeed
+        path = self.write([(f"01/{m:02d}/2024", 100 + m) for m in range(1, 13)])
+        dates = [c.timestamp.date() for c in CSVFeed(path, date_order="month-first")]
+        self.assertTrue(all(d.month == 1 for d in dates))
+
+    def test_a_file_mixing_both_orderings_is_rejected(self):
+        from trading_bot.data import CSVFeed
+        path = self.write([("15/04/2024", 100), ("04/15/2024", 101)])
+        with self.assertRaises(ValueError) as ctx:
+            list(CSVFeed(path))
+        self.assertIn("not one consistent format", str(ctx.exception))
+
+    def test_iso_files_are_unaffected(self):
+        from trading_bot.data import CSVFeed
+        path = self.write([("2024-01-02", 100), ("2024-02-02", 101)])
+        self.assertEqual(len(list(CSVFeed(path))), 2)
+
+    def test_googlefinance_export_still_loads(self):
+        from trading_bot.data import CSVFeed
+        path = self.write([("1/2/2024 16:00:00", 100), ("1/15/2024 16:00:00", 101)])
+        dates = [c.timestamp.date() for c in CSVFeed(path)]
+        self.assertEqual([d.month for d in dates], [1, 1])
+        self.assertEqual([d.day for d in dates], [2, 15])
+
+    def test_detect_rejects_an_invalid_override(self):
+        from trading_bot.data import CSVFeed
+        with self.assertRaises(ValueError):
+            CSVFeed(self.write([("2024-01-02", 100)]), date_order="whenever")
+
+    def test_detection_reports_the_file_in_its_message(self):
+        from trading_bot.data import AmbiguousDateOrder, CSVFeed
+        path = self.write([("01/02/2024", 100), ("01/03/2024", 101)], name="eu.csv")
+        with self.assertRaises(AmbiguousDateOrder) as ctx:
+            list(CSVFeed(path))
+        self.assertIn("eu.csv", str(ctx.exception))

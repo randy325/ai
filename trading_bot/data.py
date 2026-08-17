@@ -10,39 +10,103 @@ from __future__ import annotations
 import csv
 import math
 import random
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 from .models import Candle
 
-_TIMESTAMP_FORMATS = (
+#: Formats that mean exactly one thing whatever the file's origin.
+_UNAMBIGUOUS_FORMATS = (
     "%Y-%m-%d %H:%M:%S%z",
     "%Y-%m-%dT%H:%M:%S%z",
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%d %H:%M",
     "%Y-%m-%d",
-    # Slash dates, month-first before day-first. Both orderings are guesses for
-    # a date like 03/04/2020, but day-first silently produced an interleaved
-    # sequence on US exports: day-first for days <= 12, month-first for >= 13.
-    # Month-first at least fails consistently, and matches what Stooq, Yahoo
-    # and Google Sheets emit.
-    #
-    # The time-bearing variants are what GOOGLEFINANCE("TICKER","all",...)
-    # produces — "1/2/2024 16:00:00" — which parsed as nothing at all until a
-    # real export was about to be pasted in.
+)
+
+#: Slash dates, which do NOT mean one thing. 03/04/2024 is 3 April in most of
+#: the world and 4 March in the US, and no amount of per-row cleverness can tell
+#: them apart — the ordering is a property of the FILE. Resolve it once with
+#: :func:`detect_date_order` and pass the answer in.
+_MONTH_FIRST_FORMATS = (
     "%m/%d/%Y %H:%M:%S",
-    "%d/%m/%Y %H:%M:%S",
     "%m/%d/%Y %H:%M",
-    "%d/%m/%Y %H:%M",
     "%m/%d/%Y",
+)
+_DAY_FIRST_FORMATS = (
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M",
     "%d/%m/%Y",
 )
 
+_SLASH_DATE = re.compile(
+    r"^\s*(\d{1,2})/(\d{1,2})/(\d{2,4})(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?\s*$"
+)
 
-def parse_timestamp(raw: str) -> datetime:
-    """Parse the timestamp formats commonly found in exported market data."""
+
+class AmbiguousDateOrder(ValueError):
+    """A file's slash dates could be read either way and nothing settles it."""
+
+
+def slash_fields(text: str) -> tuple[int, int] | None:
+    """The first two numbers of a slash date, or None if it is not one."""
+    match = _SLASH_DATE.match(text)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def detect_date_order(samples) -> str:
+    """Resolve slash-date ordering for a whole file from its own contents.
+
+    A value above 12 in the first field can only be a day; above 12 in the
+    second can only be a month. One such row settles the entire file.
+
+    Deciding per row instead is the trap this replaces: with both orderings in
+    one fallback list, a European file parses days 1-12 as months and days
+    13-31 correctly, interleaving two calendars. Worse, a monthly series dated
+    the 1st reads as consecutive days of January — ascending, so the
+    chronological check never fires and the corruption is silent.
+    """
+    first_over_12 = second_over_12 = False
+    saw_slash = False
+    for sample in samples:
+        fields = slash_fields(sample) if sample else None
+        if fields is None:
+            continue
+        saw_slash = True
+        first, second = fields
+        first_over_12 |= first > 12
+        second_over_12 |= second > 12
+
+    if not saw_slash:
+        return "month-first"  # no slash dates; the answer is irrelevant
+    if first_over_12 and second_over_12:
+        raise ValueError(
+            "date column contains both DD/MM and MM/DD rows — it is not one "
+            "consistent format, so it cannot be read safely"
+        )
+    if first_over_12:
+        return "day-first"
+    if second_over_12:
+        return "month-first"
+    raise AmbiguousDateOrder(
+        "every slash date in this file has both fields <= 12, so day-first and "
+        "month-first are equally consistent with it. Pass date_order='day-first' "
+        "or 'month-first' explicitly — guessing would silently shift every bar"
+    )
+
+
+
+def parse_timestamp(raw: str, date_order: str = "month-first") -> datetime:
+    """Parse a timestamp from exported market data.
+
+    ``date_order`` settles slash dates and must come from
+    :func:`detect_date_order` when reading a file. The default here serves
+    single-value use only; :class:`CSVFeed` never relies on it, because a lone
+    date genuinely cannot be disambiguated and a file usually can.
+    """
     text = raw.strip()
     if not text:
         raise ValueError("empty timestamp")
@@ -54,7 +118,10 @@ def parse_timestamp(raw: str) -> datetime:
             epoch //= 1000
         return datetime.fromtimestamp(epoch, tz=timezone.utc)
 
-    for fmt in _TIMESTAMP_FORMATS:
+    if date_order not in ("month-first", "day-first"):
+        raise ValueError(f"date_order must be 'month-first' or 'day-first', got {date_order!r}")
+    slash = _DAY_FIRST_FORMATS if date_order == "day-first" else _MONTH_FIRST_FORMATS
+    for fmt in (*_UNAMBIGUOUS_FORMATS, *slash):
         try:
             return datetime.strptime(text, fmt)
         except ValueError:
@@ -137,11 +204,44 @@ class CSVFeed(DataFeed):
         "volume": ("volume", "v", "vol", "quantity"),
     }
 
-    def __init__(self, path: str | Path, symbol: str = "") -> None:
+    def __init__(self, path: str | Path, symbol: str = "", date_order: str = "auto") -> None:
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(f"no such data file: {self.path}")
+        if date_order not in ("auto", "month-first", "day-first"):
+            raise ValueError(
+                f"date_order must be 'auto', 'month-first' or 'day-first', got {date_order!r}"
+            )
         self.symbol = symbol or self.path.stem.upper()
+        #: "auto" resolves slash-date ordering from the file's own contents and
+        #: raises if nothing in it settles the question.
+        self.date_order = date_order
+
+    def _scan_date_order(self, column: str) -> str:
+        """Resolve the file's slash-date ordering in one pass, before parsing.
+
+        Ordering is a property of the file, not of a row, so it is decided once
+        and applied to every row. Deciding per row is what let a European file
+        parse days 1-12 as months while reading 13-31 correctly.
+        """
+        if self.date_order != "auto":
+            return self.date_order
+        with self.path.open(newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            samples = []
+            for row in reader:
+                raw = (row.get(column) or "").strip()
+                if not raw:
+                    continue
+                if not samples and slash_fields(raw) is None:
+                    # First real value is not a slash date, so the question does
+                    # not arise. Avoids reading the whole file for nothing.
+                    return "month-first"
+                samples.append(raw)
+        try:
+            return detect_date_order(samples)
+        except AmbiguousDateOrder as exc:
+            raise AmbiguousDateOrder(f"{self.path}: {exc}") from None
 
     def _resolve_columns(self, fieldnames: Sequence[str]) -> dict[str, str]:
         lookup = {name.strip().lower(): name for name in fieldnames}
@@ -174,6 +274,7 @@ class CSVFeed(DataFeed):
             if not reader.fieldnames:
                 return
             columns = self._resolve_columns(reader.fieldnames)
+            date_order = self._scan_date_order(columns["timestamp"])
 
             previous: datetime | None = None
             for line_number, row in enumerate(reader, start=2):
@@ -181,7 +282,7 @@ class CSVFeed(DataFeed):
                 if raw_timestamp is None or not raw_timestamp.strip():
                     continue
                 try:
-                    timestamp = parse_timestamp(raw_timestamp)
+                    timestamp = parse_timestamp(raw_timestamp, date_order)
                     close = float(row[columns["close"]])
                     open_ = float(row[columns["open"]]) if "open" in columns else close
                     high = float(row[columns["high"]]) if "high" in columns else max(open_, close)

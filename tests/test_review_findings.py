@@ -614,9 +614,16 @@ class TestFinding10AmbiguousDatesParseDayFirst(unittest.TestCase):
         from trading_bot.data import parse_timestamp
         self.assertEqual(parse_timestamp("03/04/2020"), datetime(2020, 3, 4))
 
-    def test_an_unambiguous_day_first_date_still_parses(self):
+    def test_a_day_first_value_needs_the_day_first_order(self):
+        # Superseded by the per-file resolver: parse_timestamp no longer falls
+        # through to the other ordering, because falling through IS the
+        # interleaving bug. The caller states the order; CSVFeed derives it.
         from trading_bot.data import parse_timestamp
-        self.assertEqual(parse_timestamp("25/12/2020"), datetime(2020, 12, 25))
+        self.assertEqual(
+            parse_timestamp("25/12/2020", date_order="day-first"), datetime(2020, 12, 25)
+        )
+        with self.assertRaises(ValueError):
+            parse_timestamp("25/12/2020", date_order="month-first")
 
     def test_iso_is_unaffected(self):
         from trading_bot.data import parse_timestamp
