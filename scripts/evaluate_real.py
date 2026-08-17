@@ -88,6 +88,21 @@ def run(strategy: str, path: Path, symbol: str, cash: float, **overrides):
     return config.build_engine().run(config.build_feed())
 
 
+def benchmark(path: Path, symbol: str, cash: float):
+    """Buy-and-hold with the risk overlay switched off.
+
+    The overlay has to go, or the benchmark is not buy-and-hold. Run through
+    the default limits, a hold position is flattened the first time equity
+    falls 25% from its peak and never re-entered: over 1999-2018 that turns
+    the S&P's +104% into -8.5% and quietly replaces the comparison with a
+    test of the circuit breaker. The benchmark must be the thing an investor
+    could have done by doing nothing.
+    """
+    return run("buy-and-hold", path, symbol, cash,
+               max_drawdown=None, daily_loss_limit=None,
+               max_trades_per_day=None, position_fraction=1.0)
+
+
 def hold_durations(result) -> float:
     if not result.trades:
         return 0.0
@@ -160,13 +175,17 @@ def main() -> int:
         # pre-flight check that would not touch the rows.
         try:
             strat = run(args.strategy, path, symbol, args.cash)
-            hold = run("buy-and-hold", path, symbol, args.cash)
+            hold = benchmark(path, symbol, args.cash)
             free = run(args.strategy, path, symbol, args.cash,
                        commission_percent=0.0, slippage_percent=0.0, spread_fraction=0.0)
+            # Same strategy, same costs, drawdown halt removed. Splits "the
+            # strategy lost money" from "the breaker stopped it early", which
+            # otherwise land in the same number.
+            unhalted = run(args.strategy, path, symbol, args.cash, max_drawdown=None)
         except (ValueError, FileNotFoundError) as exc:
             failures.append((symbol, f"unreadable: {exc}"))
             continue
-        rows.append((symbol, description, strat, hold, free))
+        rows.append((symbol, description, strat, hold, free, unhalted))
 
     if failures:
         print("Skipped:", file=sys.stderr)
@@ -188,35 +207,43 @@ def main() -> int:
               f"{'sharpe':>8}{'maxDD':>8}{'trades':>8}{'win%':>7}{'avg hold':>10}")
     print(header)
     print("-" * len(header))
-    for symbol, _, strat, hold, _free in rows:
+    for symbol, _, strat, hold, _free, _unhalted in rows:
         m, b = strat.metrics, hold.metrics
         period = f"{m.start:%Y-%m}..{m.end:%Y-%m}" if m.start else "?"
         print(
             f"{symbol:<11}{period:<20}{m.total_return:>7.1%}{b.total_return:>8.1%}"
             f"{m.total_return - b.total_return:>+8.1%}{m.sharpe_ratio:>8.2f}"
             f"{m.max_drawdown:>8.1%}{m.num_trades:>8}{m.win_rate:>7.0%}"
-            f"{hold_durations(strat):>9.0f}d"
+            f"{hold_durations(strat):>9.0f}d{'  HALTED' if strat.halted else ''}"
         )
 
     # -- cost sensitivity on the same real data -----------------------------
     print(f"\n{'instrument':<11}{'with costs':>12}{'no costs':>12}{'cost drag':>12}"
-          f"{'fees paid':>12}{'beats B&H?':>12}")
-    print("-" * 71)
-    for symbol, _, strat, hold, free in rows:
-        m, b, f = strat.metrics, hold.metrics, free.metrics
+          f"{'no halt':>12}{'fees paid':>12}{'beats B&H?':>12}")
+    print("-" * 83)
+    for symbol, _, strat, hold, free, unhalted in rows:
+        m, b, f, u = strat.metrics, hold.metrics, free.metrics, unhalted.metrics
         beats = "yes" if m.total_return > b.total_return else "NO"
         print(
             f"{symbol:<11}{m.total_return:>11.1%}{f.total_return:>12.1%}"
-            f"{f.total_return - m.total_return:>+12.1%}"
+            f"{f.total_return - m.total_return:>+12.1%}{u.total_return:>12.1%}"
             f"{m.total_commission:>11,.0f}{beats:>12}"
         )
 
     # -- the things that make a good backtest untradeable -------------------
     print("\nWarnings")
-    print("-" * 71)
+    print("-" * 83)
     warnings = []
-    for symbol, _, strat, hold, free in rows:
-        m, b, f = strat.metrics, hold.metrics, free.metrics
+    for symbol, _, strat, hold, free, unhalted in rows:
+        m, b, f, u = strat.metrics, hold.metrics, free.metrics, unhalted.metrics
+        if strat.halted:
+            last = f"{strat.trades[-1].exit_time:%Y-%m}" if strat.trades else "?"
+            warnings.append(
+                f"{symbol}: HALTED ({strat.halt_reason}) — stopped trading after {last} "
+                f"and held cash for the rest of the period. The headline number is the "
+                f"breaker, not the strategy; without it the run returns {u.total_return:.1%} "
+                f"on {u.num_trades} trades"
+            )
         if m.num_trades < MIN_TRADES_FOR_SIGNIFICANCE:
             warnings.append(
                 f"{symbol}: only {m.num_trades} trades — below {MIN_TRADES_FOR_SIGNIFICANCE}, "
@@ -237,7 +264,7 @@ def main() -> int:
         if m.exposure < 0.05 and m.num_trades:
             warnings.append(f"{symbol}: in the market only {m.exposure:.1%} of the time")
 
-    beat_count = sum(1 for _, _, s, h, _ in rows if s.metrics.total_return > h.metrics.total_return)
+    beat_count = sum(1 for _, _, s, h, _, _u in rows if s.metrics.total_return > h.metrics.total_return)
     if beat_count == 0:
         warnings.append("beats buy-and-hold on ZERO instruments after costs")
     elif beat_count < len(rows) / 2:
@@ -250,9 +277,9 @@ def main() -> int:
         print(f"  - {warning}")
 
     # -- verdict ------------------------------------------------------------
-    total_trades = sum(s.metrics.num_trades for _, _, s, _, _ in rows)
+    total_trades = sum(s.metrics.num_trades for _, _, s, _, _, _u in rows)
     median_edge = statistics.median(
-        s.metrics.total_return - h.metrics.total_return for _, _, s, h, _ in rows
+        s.metrics.total_return - h.metrics.total_return for _, _, s, h, _, _u in rows
     )
     print("\nVerdict")
     print("-" * 71)

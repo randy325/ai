@@ -6,6 +6,7 @@ and peak metrics are tested against sequences whose shape is known by
 construction.
 """
 
+import datetime
 import importlib.util
 import io
 import random
@@ -423,6 +424,59 @@ class TestOfflineEvaluation(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("one file per instrument", out)
         self.assertIn("chronological", out)
+
+
+class TestBenchmarkIsUnmanaged(unittest.TestCase):
+    """The buy-and-hold baseline must not be run through the risk overlay.
+
+    Found on real data: over 1999-2018 the S&P rose 104%, but the evaluation
+    reported buy-and-hold at -8.5%, because the default 25% drawdown limit
+    flattened the hold position in the 2001 crash and never re-entered. Every
+    "edge vs B&H" number in the table was then measuring the circuit breaker.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.path = self.dir / "crash.csv"
+        # Up 50%, down 40% (breaching any 25% drawdown limit), then up to a
+        # new high. A real hold ends well ahead; a halted one ends at the
+        # bottom, in cash.
+        legs = [(0, 60, 100.0, 150.0), (60, 140, 150.0, 90.0), (140, 260, 90.0, 240.0)]
+        rows = []
+        for start, end, first, last in legs:
+            span = end - start
+            for step in range(span):
+                rows.append(first + (last - first) * step / span)
+        rows.append(240.0)
+        lines = ["date,open,high,low,close,volume"]
+        start_day = datetime.date(2000, 1, 3)
+        for index, price in enumerate(rows):
+            day = start_day + datetime.timedelta(days=index)
+            lines.append(f"{day.isoformat()},{price:.4f},{price * 1.005:.4f},"
+                         f"{price * 0.995:.4f},{price:.4f},1000000")
+        self.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.total = rows[-1] / rows[0] - 1.0
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_hold_through_a_deep_drawdown_tracks_the_instrument(self):
+        result = evaluate.benchmark(self.path, "CRASH", 10_000.0)
+        self.assertFalse(result.halted, f"benchmark was halted: {result.halt_reason}")
+        self.assertGreater(
+            result.metrics.total_return, 0.9 * self.total,
+            "buy-and-hold must track the instrument, not be flattened by the "
+            "drawdown limit partway through",
+        )
+
+    def test_the_managed_run_is_what_the_benchmark_must_not_be(self):
+        # Guards the premise: with the overlay on, the same hold really does
+        # halt and end far below the instrument. If this ever stops halting the
+        # test above proves nothing.
+        managed = evaluate.run("buy-and-hold", self.path, "CRASH", 10_000.0)
+        self.assertTrue(managed.halted)
+        self.assertLess(managed.metrics.total_return, 0.5 * self.total)
 
 
 if __name__ == "__main__":
