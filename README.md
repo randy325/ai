@@ -362,13 +362,46 @@ reported return is an estimate of nothing. Treat it as a way to check whether a
 strategy is robust across neighbouring parameters — a lone spike surrounded by
 losers is noise — not as a way to pick the winner.
 
+### Parameter robustness (synthetic)
+
+```bash
+python scripts/robustness_sweep.py --strategy rsi-breakout
+```
+
+Varies each numeric parameter ±30% around its current value, running every
+setting across several synthetic paths and taking the median so one lucky path
+cannot make a parameter look good. It reports the *shape* of the performance
+surface, not the level:
+
+- **roughness** — mean step between neighbouring settings over the total range.
+  A smooth curve over *n* points steps about `1/(n-1)` of its range each time;
+  an alternating surface approaches 100%. Above 50% the neighbours of a setting
+  tell you nothing about it, so the setting is a draw from noise.
+- **peaked** — the configured value is the single best *and* clears the median
+  of its neighbours. That is the signature of a value that was tuned rather
+  than found.
+- **no effect** — varying it changed nothing, so it is inert in this
+  configuration. Not overfit, but not doing anything either.
+
+The two detectors are complementary, and neither subsumes the other: a lone
+spike surrounded by flat values scores *low* on roughness, because only two of
+its steps are non-zero — that shape is what `is_peaked` exists to catch.
+
+**Read the returns in this sweep as a null result, not a verdict.** On a random
+walk with real costs the expected return of any strategy is negative, so
+near-zero numbers are exactly what should appear. A profitable sweep here would
+suggest a bug rather than an edge. Synthetic data can answer "does this depend
+on precise parameter values" honestly, because there is no market structure to
+overfit *to* — it cannot answer "does this make money". Use
+`scripts/evaluate_real.py` on real bars for that.
+
 ## Tests
 
 ```bash
 python -m unittest discover -s tests
 ```
 
-368 tests covering position accounting through to the CLI. The ones worth
+466 tests covering position accounting through to the CLI. The ones worth
 knowing about assert properties that are easy to get quietly wrong: that a
 signal cannot be filled on its own bar, that buy-and-hold produces exactly one
 round trip (an early version churned 33 times as its fixed-fraction target
@@ -380,6 +413,48 @@ network, and they cover each API's awkward corners: Yahoo pads holidays with
 nulls, Coinbase orders its columns `low, high, open, close` and returns rows
 newest-first, Binance's last kline is usually still forming, and Stooq reports
 errors as HTTP 200 with a plain-text body.
+
+### Getting bars without network access
+
+If the machine running the bot cannot reach the data providers — a locked-down
+box, an egress policy, an offline laptop — export the CSVs by hand and point
+the evaluation at a directory instead.
+
+**From Stooq**, which needs no account:
+
+1. Open `https://stooq.com/q/d/?s=SYMBOL`, e.g.
+   [stooq.com/q/d/?s=spy.us](https://stooq.com/q/d/?s=spy.us). US tickers take
+   a `.us` suffix (`spy.us`, `aapl.us`); indices take a caret (`^spx`).
+2. Set the date range and interval (Daily) at the top of the page.
+3. Click the **Download data in csv file** link under the table.
+4. Save it as `data/manual/<symbol>.csv` — the filename becomes the instrument
+   name, so `spy.us.csv` is better renamed `spy.csv`.
+
+The direct download URL is `https://stooq.com/q/d/l/?s=spy.us&i=d`, which is
+convenient with `curl` or a browser but is the same endpoint the `stooq`
+provider uses, so it is blocked wherever the provider is. Stooq rate-limits by
+IP and returns `Exceeded the daily hits limit` as plain text with HTTP 200 —
+if a "CSV" opens as that sentence, wait rather than retrying in a loop.
+
+Yahoo's *Historical Data* tab has an equivalent **Download** link if you prefer
+it, and its export is read unmodified too.
+
+Then run the evaluation entirely offline:
+
+```bash
+python scripts/evaluate_real.py --csv-dir data/manual --strategy rsi-breakout
+python scripts/evaluate_real.py --csv-format     # the exact layout expected
+```
+
+One file per instrument. A date column and a close column are required;
+`open`/`high`/`low`/`volume` are optional but worth having — without a real
+high and low, the ATR stop and the breakout channel are computed from closes
+alone and understate the true range, which flatters any stop-based strategy.
+Rows must be chronological; the loader rejects out-of-order dates rather than
+sorting them, because a shuffled file usually means two series got concatenated.
+
+Note that `.gitignore` excludes `data/` and `*.csv`, so exported bars stay out
+of the repository.
 
 ### Comparing strategies on real data
 

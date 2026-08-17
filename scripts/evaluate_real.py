@@ -1,7 +1,7 @@
 """Evaluate a strategy against real market data across several regimes.
 
-    python scripts/evaluate_real.py                       # default basket
-    python scripts/evaluate_real.py --strategy breakout
+    python scripts/evaluate_real.py                       # fetch the default basket
+    python scripts/evaluate_real.py --csv-dir data/manual # use local CSV files
     python scripts/evaluate_real.py --instruments SPY:yahoo QQQ:yahoo
 
 Runs each instrument separately — never pooled — because a single blended
@@ -12,6 +12,10 @@ that make a good-looking backtest untradeable.
 
 Bars are fetched once per instrument and frozen to CSV, so every variant runs
 on byte-identical data.
+
+With --csv-dir nothing is fetched at all, so the evaluation works with no
+network access. See the CSV_FORMAT text below, or run --help, for the expected
+file layout.
 """
 
 import argparse
@@ -24,6 +28,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from trading_bot import RunConfig  # noqa: E402
 from trading_bot.data import write_csv  # noqa: E402
 from trading_bot.providers import DataFeedError, build_provider  # noqa: E402
+
+CSV_FORMAT = """\
+Expected --csv-dir layout: one file per instrument, named for the symbol.
+
+    data/manual/spy.csv   -> instrument SPY
+    data/manual/qqq.csv   -> instrument QQQ
+    data/manual/btcusdt.csv
+
+Each file needs a date column and a close column; open/high/low/volume are
+optional but recommended, since without a real high and low the ATR stop and
+breakout channel are computed from closes alone and understate the range.
+Column names are matched case-insensitively and common aliases are accepted
+(date/time/timestamp, adj close, vol), so a file exported straight from Stooq
+or Yahoo works unmodified:
+
+    Date,Open,High,Low,Close,Volume
+    2022-01-03,476.30,477.85,473.85,477.71,72668000
+    2022-01-04,479.22,479.98,475.58,477.55,71178700
+
+Rows must be in chronological order; the loader rejects out-of-order dates
+rather than silently sorting, because a shuffled file usually means two
+different series were concatenated."""
+
 
 # A deliberate spread of regimes. Trend, chop and drawdown are different
 # problems, and a strategy that only survives one of them has not been tested.
@@ -72,35 +99,71 @@ def main() -> int:
     parser.add_argument("--out-dir", default="data/evaluation")
     parser.add_argument("--instruments", nargs="*",
                         help="SYMBOL:PROVIDER pairs, overriding the default basket")
+    parser.add_argument("--csv-dir", metavar="DIR",
+                        help="read local CSV files instead of fetching; "
+                             "one file per instrument, named for the symbol. "
+                             "Run with --csv-format for the full layout")
+    parser.add_argument("--csv-format", action="store_true",
+                        help="print the expected --csv-dir file format and exit")
     args = parser.parse_args()
 
-    if args.instruments:
-        basket = []
-        for item in args.instruments:
-            symbol, _, provider = item.partition(":")
-            basket.append((symbol, provider or "yahoo", ""))
-    else:
-        basket = DEFAULT_BASKET
+    if args.csv_format:
+        print(CSV_FORMAT)
+        return 0
 
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     rows, failures = [], []
-    for symbol, provider_name, description in basket:
-        try:
-            path = fetch(symbol, provider_name, args.interval, args.limit, out_dir)
-        except DataFeedError as exc:
-            failures.append((symbol, str(exc)))
-            continue
 
-        strat = run(args.strategy, path, symbol, args.cash)
-        hold = run("buy-and-hold", path, symbol, args.cash)
-        free = run(args.strategy, path, symbol, args.cash,
-                   commission_percent=0.0, slippage_percent=0.0, spread_fraction=0.0)
+    if args.csv_dir:
+        # Offline path: no provider, no network, no cache.
+        csv_dir = Path(args.csv_dir)
+        if not csv_dir.is_dir():
+            print(f"error: {csv_dir} is not a directory", file=sys.stderr)
+            return 2
+        paths = sorted(p for p in csv_dir.glob("*.csv") if p.is_file())
+        if not paths:
+            print(f"error: no .csv files in {csv_dir}", file=sys.stderr)
+            print(CSV_FORMAT, file=sys.stderr)
+            return 2
+        source = f"local CSV files in {csv_dir}"
+        sources = [(p.stem.upper(), p, "") for p in paths]
+    else:
+        if args.instruments:
+            basket = []
+            for item in args.instruments:
+                symbol, _, provider = item.partition(":")
+                basket.append((symbol, provider or "yahoo", ""))
+        else:
+            basket = DEFAULT_BASKET
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source = "fetched from providers"
+        sources = []
+        for symbol, provider_name, description in basket:
+            try:
+                sources.append(
+                    (symbol, fetch(symbol, provider_name, args.interval, args.limit, out_dir),
+                     description)
+                )
+            except DataFeedError as exc:
+                failures.append((symbol, str(exc)))
+
+    for symbol, path, description in sources:
+        # CSVFeed parses lazily, so a malformed file only raises once the
+        # engine pulls bars from it. One bad export must not sink the rest of
+        # the basket, so the runs themselves are guarded rather than a
+        # pre-flight check that would not touch the rows.
+        try:
+            strat = run(args.strategy, path, symbol, args.cash)
+            hold = run("buy-and-hold", path, symbol, args.cash)
+            free = run(args.strategy, path, symbol, args.cash,
+                       commission_percent=0.0, slippage_percent=0.0, spread_fraction=0.0)
+        except (ValueError, FileNotFoundError) as exc:
+            failures.append((symbol, f"unreadable: {exc}"))
+            continue
         rows.append((symbol, description, strat, hold, free))
 
     if failures:
-        print("Could not fetch:", file=sys.stderr)
+        print("Skipped:", file=sys.stderr)
         for symbol, error in failures:
             print(f"  {symbol}: {error}", file=sys.stderr)
         if not rows:
@@ -111,6 +174,8 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+
+    print(f"Data source: {source}\n")
 
     # -- per instrument, never pooled ---------------------------------------
     header = (f"{'instrument':<11}{'period':<20}{'strat':>8}{'B&H':>8}{'edge':>8}"
