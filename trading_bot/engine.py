@@ -126,9 +126,15 @@ class TradingEngine:
             if pending is not None:
                 # Fill last bar's decision at this bar's open.
                 self.broker.mark_price(candle.symbol, candle.open)
+                closed_before = len(self.broker.trades)
                 fill = self.broker.submit(pending, candle, reference_price=candle.open)
                 if fill is not None:
                     self.risk.record_trade()
+                    # An adaptive risk layer needs the result of each round
+                    # trip, not just that a fill happened.
+                    if hasattr(self.risk, "record_result"):
+                        for trade in self.broker.trades[closed_before:]:
+                            self.risk.record_result(trade.pnl)
                     logger.info(
                         "%s %s %.4f %s @ %.4f (%s)",
                         fill.timestamp.date(),

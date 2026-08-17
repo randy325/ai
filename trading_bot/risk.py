@@ -7,11 +7,14 @@ means a risk rule can be changed without touching strategy logic.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date
 
 from .indicators import ATR
 from .models import Candle, Signal
+
+logger = logging.getLogger("trading_bot.risk")
 
 
 @dataclass
@@ -193,3 +196,119 @@ class RiskManager:
         notional = self.sizer.target_notional(signal, equity, candle)
         cap = equity * self.limits.max_position_fraction
         return max(min(notional, cap), -cap)
+
+
+@dataclass
+class RiskTier:
+    """One named risk posture the bot can switch between."""
+
+    name: str
+    max_position_fraction: float
+    max_drawdown: float | None
+    risk_per_trade: float = 0.02
+    daily_loss_limit: float | None = None
+
+    def to_limits(self, max_trades_per_day: int | None = None) -> RiskLimits:
+        return RiskLimits(
+            max_position_fraction=self.max_position_fraction,
+            max_drawdown=self.max_drawdown,
+            daily_loss_limit=self.daily_loss_limit,
+            risk_per_trade=self.risk_per_trade,
+            max_trades_per_day=max_trades_per_day,
+        )
+
+
+AGGRESSIVE = RiskTier("aggressive", max_position_fraction=1.0, max_drawdown=0.35, risk_per_trade=0.04)
+MODERATE = RiskTier("moderate", max_position_fraction=0.95, max_drawdown=0.25, risk_per_trade=0.02)
+CONSERVATIVE = RiskTier(
+    "conservative",
+    max_position_fraction=0.5,
+    max_drawdown=0.15,
+    risk_per_trade=0.01,
+    daily_loss_limit=0.03,
+)
+
+
+class TieredRiskManager(RiskManager):
+    """Switches risk posture with account size and recent results.
+
+    Below ``tier_threshold`` of equity the bot runs ``aggressive``; at or above
+    it, ``moderate`` — a small account can afford variance that a large one
+    cannot. A run of ``losing_streak`` consecutive losing trades overrides both
+    and drops to ``conservative`` until ``recovery_wins`` trades come back
+    green.
+
+    The demotion is deliberately easier than the promotion. Sizing up into a
+    losing streak is how an account with an edge still ends at zero, so the
+    ratchet is asymmetric on purpose.
+    """
+
+    def __init__(
+        self,
+        sizer: PositionSizer | None = None,
+        tier_threshold: float = 10_000.0,
+        losing_streak: int = 3,
+        recovery_wins: int = 2,
+        max_trades_per_day: int | None = None,
+        aggressive: RiskTier = AGGRESSIVE,
+        moderate: RiskTier = MODERATE,
+        conservative: RiskTier = CONSERVATIVE,
+    ) -> None:
+        if tier_threshold <= 0:
+            raise ValueError("tier_threshold must be positive")
+        if losing_streak < 1 or recovery_wins < 1:
+            raise ValueError("losing_streak and recovery_wins must be >= 1")
+
+        self.tier_threshold = tier_threshold
+        self.losing_streak = losing_streak
+        self.recovery_wins = recovery_wins
+        self.max_trades_per_day = max_trades_per_day
+        self.aggressive = aggressive
+        self.moderate = moderate
+        self.conservative = conservative
+
+        self.tier = aggressive
+        self._demoted = False
+        self._losses = 0
+        self._wins = 0
+        self.tier_changes: list[tuple[str, str]] = []
+
+        super().__init__(self.tier.to_limits(max_trades_per_day), sizer)
+
+    def _select(self, equity: float) -> RiskTier:
+        if self._demoted:
+            return self.conservative
+        return self.aggressive if equity < self.tier_threshold else self.moderate
+
+    def _apply(self, tier: RiskTier, why: str) -> None:
+        if tier.name == self.tier.name:
+            return
+        self.tier_changes.append((self.tier.name, tier.name))
+        logger.info("risk tier %s -> %s (%s)", self.tier.name, tier.name, why)
+        self.tier = tier
+        # Replace the limits, but keep the drawdown state: the high-water mark
+        # and any halt already reached are properties of the account, not of
+        # the posture it happens to be in.
+        self.limits = tier.to_limits(self.max_trades_per_day)
+
+    def observe(self, candle: Candle, equity: float) -> None:
+        self._apply(self._select(equity), f"equity {equity:,.0f}")
+        super().observe(candle, equity)
+
+    def record_result(self, pnl: float) -> None:
+        """Feed a closed trade's P&L in, so the tier can react to results."""
+        if pnl > 0:
+            self._wins += 1
+            self._losses = 0
+            if self._demoted and self._wins >= self.recovery_wins:
+                self._demoted = False
+                self._wins = 0
+        else:
+            self._losses += 1
+            self._wins = 0
+            if self._losses >= self.losing_streak:
+                self._demoted = True
+
+    @property
+    def demoted(self) -> bool:
+        return self._demoted

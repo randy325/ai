@@ -11,6 +11,7 @@ from .broker import Commission, PaperBroker, SlippageModel
 from .data import CSVFeed, DataFeed, SyntheticFeed
 from .engine import TradingEngine
 from .providers import (
+    FallbackProvider,
     LiveFeed,
     MarketDataFeed,
     MockProvider,
@@ -18,7 +19,14 @@ from .providers import (
     SimulatedClock,
     build_provider,
 )
-from .risk import FixedFractionSizer, PositionSizer, RiskLimits, RiskManager, VolatilitySizer
+from .risk import (
+    FixedFractionSizer,
+    PositionSizer,
+    RiskLimits,
+    RiskManager,
+    TieredRiskManager,
+    VolatilitySizer,
+)
 from .strategy import Strategy, TrendFilter, build_strategy
 
 
@@ -31,6 +39,11 @@ class RunConfig:
     symbol: str = "SYNTH"
     data_file: str | None = None
     provider: str | None = None
+    #: Ordered fallback chain. The first provider that answers is used; this is
+    #: redundancy against a dead endpoint, not a blend of several feeds.
+    providers: list[str] = field(default_factory=list)
+    #: Per-provider ticker overrides, e.g. {"stooq": "aapl.us", "yahoo": "AAPL"}.
+    provider_symbols: dict = field(default_factory=dict)
     interval: str = "1d"
     limit: int = 500
     cache_dir: str | None = ".cache/market-data"
@@ -55,6 +68,13 @@ class RunConfig:
     daily_loss_limit: float | None = None
     max_trades_per_day: int | None = None
 
+    #: "static" uses the fields above unchanged; "tiered" switches posture with
+    #: account size and recent results.
+    risk_profile: str = "static"
+    tier_threshold: float = 10_000.0
+    losing_streak: int = 3
+    recovery_wins: int = 2
+
     allow_short: bool = False
     max_leverage: float = 1.0
     trend_filter: int | None = None
@@ -78,21 +98,30 @@ class RunConfig:
     # -- component factories -------------------------------------------------
 
     def build_provider(self) -> Provider:
-        """The configured live-data provider, wrapped in a disk cache."""
-        if not self.provider:
+        """The configured live-data provider, wrapped in a disk cache.
+
+        A ``providers`` list builds a fallback chain; a single ``provider``
+        builds that one.
+        """
+        names = self.providers or ([self.provider] if self.provider else [])
+        if not names:
             raise ValueError("no provider configured")
-        return build_provider(
-            self.provider,
-            cache_dir=self.cache_dir or None,
-            cache_ttl=timedelta(hours=self.cache_hours),
-        )
+
+        cache_ttl = timedelta(hours=self.cache_hours)
+        members = [
+            build_provider(name, cache_dir=self.cache_dir or None, cache_ttl=cache_ttl)
+            for name in names
+        ]
+        if len(members) == 1:
+            return members[0]
+        return FallbackProvider(members, self.provider_symbols)
 
     def build_feed(self) -> DataFeed:
         # A data file wins over a provider: local data is explicit, and it is
         # what you want when reproducing a run exactly.
         if self.data_file:
             return CSVFeed(self.data_file, symbol=self.symbol)
-        if self.provider:
+        if self.provider or self.providers:
             return MarketDataFeed(
                 self.build_provider(), self.symbol, self.interval, self.limit
             )
@@ -138,6 +167,19 @@ class RunConfig:
         raise ValueError(f"unknown sizer {self.sizer!r}; expected 'fixed' or 'volatility'")
 
     def build_risk(self) -> RiskManager:
+        if self.risk_profile == "tiered":
+            return TieredRiskManager(
+                sizer=self.build_sizer(),
+                tier_threshold=self.tier_threshold,
+                losing_streak=self.losing_streak,
+                recovery_wins=self.recovery_wins,
+                max_trades_per_day=self.max_trades_per_day,
+            )
+        if self.risk_profile != "static":
+            raise ValueError(
+                f"unknown risk_profile {self.risk_profile!r}; expected 'static' or 'tiered'"
+            )
+
         limits = RiskLimits(
             max_position_fraction=self.position_fraction,
             max_drawdown=self.max_drawdown,
@@ -159,10 +201,12 @@ class RunConfig:
         accelerated clock; a real one is bound to real time, and asking it to
         hurry just polls an unchanged endpoint more often.
         """
-        if not self.provider:
+        names = self.providers or ([self.provider] if self.provider else [])
+        if not names:
             raise ValueError("live paper trading needs --provider")
 
-        provider = build_provider(self.provider)
+        members = [build_provider(name) for name in names]
+        provider = members[0] if len(members) == 1 else FallbackProvider(members, self.provider_symbols)
         clock = SimulatedClock(speed)
         if isinstance(provider, MockProvider):
             provider.time_source = clock.now

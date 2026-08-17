@@ -614,6 +614,63 @@ class MockProvider(Provider):
         return [self._bar(i, interval, symbol) for i in range(newest - count + 1, newest + 1)]
 
 
+class FallbackProvider(Provider):
+    """Tries several providers in order until one returns bars.
+
+    Free endpoints are unofficial and go down; a chain means a session survives
+    one of them failing. It is a redundancy mechanism, not a consensus one —
+    the first provider that answers wins, and its prices are used as-is.
+
+    Prices are *not* blended across providers. Two feeds for the same
+    instrument disagree on venue, timestamp convention and adjustment, so
+    averaging them produces bars that never traded anywhere.
+    """
+
+    name = "fallback"
+
+    def __init__(self, providers: Sequence[Provider], symbols: dict[str, str] | None = None) -> None:
+        if not providers:
+            raise ValueError("a fallback chain needs at least one provider")
+        super().__init__()
+        self.providers = list(providers)
+        #: Per-provider symbol overrides, since tickers differ by venue
+        #: (AAPL vs aapl.us, BTCUSDT vs BTC-USD).
+        self.symbols = symbols or {}
+        self.used: str | None = None
+
+    @property
+    def intervals(self) -> tuple[str, ...]:
+        """Intervals every member supports — the chain is only as broad."""
+        common = set(self.providers[0].intervals)
+        for provider in self.providers[1:]:
+            common &= set(provider.intervals)
+        return tuple(i for i in INTERVAL_SECONDS if i in common)
+
+    def describe(self) -> str:
+        return " -> ".join(p.name for p in self.providers)
+
+    def fetch(self, symbol: str, interval: str = "1d", limit: int = 500) -> list[Candle]:
+        errors: list[str] = []
+        for provider in self.providers:
+            if interval not in provider.intervals:
+                errors.append(f"{provider.name}: no {interval} bars")
+                continue
+            resolved = self.symbols.get(provider.name, symbol)
+            try:
+                candles = provider.fetch(resolved, interval, limit)
+            except DataFeedError as exc:
+                errors.append(f"{provider.name}: {exc}")
+                logger.warning("%s failed, trying next provider: %s", provider.name, exc)
+                continue
+            self.used = provider.name
+            return candles
+
+        raise DataFeedError(
+            f"every provider in the chain failed for {symbol!r} at {interval}:\n  "
+            + "\n  ".join(errors)
+        )
+
+
 PROVIDERS: dict[str, type[Provider]] = {
     MockProvider.name: MockProvider,
     StooqProvider.name: StooqProvider,

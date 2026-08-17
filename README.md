@@ -154,6 +154,7 @@ sizes and exits as intended; use real data to find out whether it works.
 | `macd-trend` | Long while the MACD line is above zero |
 | `breakout` | Donchian channel breakout with an ATR trailing stop |
 | `rsi-breakout` | Breakout entries, filtered and exited by RSI |
+| `ensemble` | Runs several strategies at once, weighted by recent performance |
 | `rsi-mean-reversion` | Buy oversold, exit when the RSI reverts to the middle |
 | `bollinger-reversion` | Fade moves outside the bands, exit at the middle band |
 
@@ -163,8 +164,63 @@ breakout already extended past `--param max_entry_rsi=70`, and exits on
 momentum exhaustion at `--param exit_rsi=80`, usually earlier than the ATR
 trailing stop would. The stop and lower channel remain as backstops.
 
+`ensemble` runs several strategies at once and blends their targets, weighted
+by a rolling shadow return — what each member would have earned holding its own
+signal. It leans toward whichever has been working without dropping the others:
+a member that has been wrong lately keeps a small floor, because it is the one
+most likely to matter when the regime turns. `mode` picks how votes combine —
+`weighted` (default), `best` to follow the leader outright, or `unanimous` to
+trade only on full agreement.
+
 Add `--allow-short` to let a strategy take the other side, and `--trend-filter 200`
 to suppress any trade fighting the 200-period EMA.
+
+## Config files
+
+A run can be described in JSON and replayed, instead of a wall of flags:
+
+```bash
+python -m trading_bot backtest --config configs/preferred.json
+python -m trading_bot backtest --config configs/preferred.json --cash 25000
+```
+
+CLI flags override the file, so a config sets the baseline and a flag varies one
+thing. Unknown keys are rejected rather than ignored, which catches typos that
+would otherwise silently run the default.
+
+Two are shipped in `configs/`:
+
+| File | What it is |
+| --- | --- |
+| `preferred.json` | Ensemble over a yahoo→stooq chain, tiered risk from $5k |
+| `preferred-mock.json` | Same settings against the offline mock, for testing |
+
+### Adaptive risk tiers
+
+`"risk_profile": "tiered"` switches posture as the account changes:
+
+| Tier | When | Max position | Risk/trade | Halt at |
+| --- | --- | --- | --- | --- |
+| aggressive | equity below `tier_threshold` | 100% | 4% | 35% drawdown |
+| moderate | equity at or above it | 95% | 2% | 25% drawdown |
+| conservative | after `losing_streak` losses | 50% | 1% | 15% drawdown |
+
+Conservative overrides account size and lifts only after `recovery_wins`
+consecutive winners. The ratchet is deliberately asymmetric — one bad trade
+should be easier to react to than one good one, because sizing up into a losing
+streak is how an account with a real edge still reaches zero.
+
+### Multiple data sources
+
+`"providers": ["yahoo", "stooq"]` is a fallback chain: the first provider that
+answers is used, so a session survives one unofficial endpoint going down. Use
+`provider_symbols` for the per-venue ticker differences (`AAPL` vs `aapl.us`).
+
+It is redundancy, **not** consensus. Prices are never blended across providers —
+two feeds for the same instrument disagree on venue, timestamp convention and
+adjustment, and averaging them produces bars that never traded anywhere. If you
+want agreement between sources to gate a trade, that is a different feature and
+would need to be built deliberately.
 
 ## Writing a strategy
 
@@ -312,7 +368,7 @@ losers is noise — not as a way to pick the winner.
 python -m unittest discover -s tests
 ```
 
-319 tests covering position accounting through to the CLI. The ones worth
+368 tests covering position accounting through to the CLI. The ones worth
 knowing about assert properties that are easy to get quietly wrong: that a
 signal cannot be filled on its own bar, that buy-and-hold produces exactly one
 round trip (an early version churned 33 times as its fixed-fraction target

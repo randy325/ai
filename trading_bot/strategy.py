@@ -8,7 +8,8 @@ function of the price history it has seen.
 
 from __future__ import annotations
 
-from typing import Callable
+from collections import deque
+from typing import Callable, Deque, Sequence
 
 from .indicators import ATR, EMA, MACD, RSI, SMA, BollingerBands, RollingHighLow
 from .models import Candle, Signal
@@ -364,6 +365,136 @@ class BollingerReversion(Strategy):
         return Signal(self._target, reason="holding reversion")
 
 
+class Ensemble(Strategy):
+    """Runs several strategies at once and blends their signals.
+
+    Every member sees every bar and votes with its own target exposure. The
+    blend is weighted by how each member has actually been doing: the ensemble
+    scores members on a rolling shadow return — what that member would have
+    earned holding its own target — and leans toward the ones that have been
+    working, without dropping the others.
+
+    ``mode`` picks how votes combine:
+
+    ``weighted``   blend by rolling score, leaning toward the best (default)
+    ``best``       follow the single best-scoring member outright
+    ``unanimous``  trade only when every member agrees on direction
+
+    Shadow scoring is not a backtest of each member. It ignores costs and
+    sizing, so it ranks members against each other and nothing more.
+    """
+
+    name = "ensemble"
+
+    def __init__(
+        self,
+        members: Sequence[str] | Sequence[Strategy] = ("breakout", "rsi-breakout", "sma-crossover"),
+        lookback: int = 200,
+        mode: str = "weighted",
+        member_params: dict | None = None,
+    ) -> None:
+        if mode not in {"weighted", "best", "unanimous"}:
+            raise ValueError("mode must be 'weighted', 'best' or 'unanimous'")
+        if lookback < 2:
+            raise ValueError("lookback must be >= 2")
+        if not members:
+            raise ValueError("an ensemble needs at least one member")
+
+        params = member_params or {}
+        self.members: list[Strategy] = [
+            m if isinstance(m, Strategy) else build_strategy(m, **params.get(m, {}))
+            for m in members
+        ]
+        self.mode = mode
+        self.lookback = lookback
+        self._scores: list[Deque[float]] = [deque(maxlen=lookback) for _ in self.members]
+        self._targets = [0.0] * len(self.members)
+        self._previous_close: float | None = None
+
+    def describe(self) -> str:
+        names = ", ".join(m.name for m in self.members)
+        return f"{self.name}({self.mode}, lookback={self.lookback}: {names})"
+
+    @property
+    def scores(self) -> list[float]:
+        """Rolling shadow return per member, best-performing highest."""
+        return [sum(s) for s in self._scores]
+
+    @property
+    def best_member(self) -> str:
+        scores = self.scores
+        return self.members[scores.index(max(scores))].name
+
+    def weights(self) -> list[float]:
+        """Normalised blend weights, leaning toward better recent scores.
+
+        Members with a non-positive score keep a small floor rather than zero:
+        a strategy that has been flat or wrong lately is the one most likely to
+        matter when the regime turns, and zeroing it makes the ensemble a
+        slower copy of whatever just worked.
+        """
+        scores = self.scores
+        if not any(self._scores[0]):
+            return [1.0 / len(self.members)] * len(self.members)
+
+        floor = 0.05
+        best = max(scores)
+        if best <= 0:
+            return [1.0 / len(self.members)] * len(self.members)
+
+        raw = [max(score / best, 0.0) + floor for score in scores]
+        total = sum(raw)
+        return [value / total for value in raw]
+
+    def on_candle(self, candle: Candle) -> Signal:
+        # Score each member on what its previous target would have earned,
+        # before asking it what it wants now.
+        if self._previous_close:
+            move = candle.close / self._previous_close - 1.0
+            for index, target in enumerate(self._targets):
+                self._scores[index].append(target * move)
+        self._previous_close = candle.close
+
+        signals = [member.on_candle(candle) for member in self.members]
+        self._targets = [s.target for s in signals]
+
+        if self.mode == "unanimous":
+            first = signals[0].target
+            if all(abs(s.target - first) < 1e-9 for s in signals):
+                return Signal(first, reason=f"all {len(signals)} agree")
+            return Signal(0.0, reason="members disagree")
+
+        if self.mode == "best":
+            index = self.scores.index(max(self.scores))
+            chosen = signals[index]
+            return Signal(
+                chosen.target,
+                reason=f"{self.members[index].name}: {chosen.reason}",
+                stop_price=chosen.stop_price,
+            )
+
+        weights = self.weights()
+        target = sum(w * s.target for w, s in zip(weights, signals))
+        target = max(-1.0, min(1.0, target))
+
+        # Carry a stop only if the members wanting exposure supplied one, and
+        # take the safest, so the risk layer never sizes off an optimistic stop.
+        stops = [
+            s.stop_price for s, w in zip(signals, weights)
+            if s.stop_price is not None and s.target * target > 0 and w > 0
+        ]
+        stop = (max(stops) if target > 0 else min(stops)) if stops else None
+
+        leader = self.best_member
+        contributors = sum(1 for s in signals if abs(s.target) > 1e-9)
+        return Signal(
+            target,
+            reason=f"{contributors}/{len(signals)} in, leader {leader}",
+            stop_price=stop,
+            metadata={"weights": weights, "leader": leader},
+        )
+
+
 class TrendFilter(Strategy):
     """Wraps another strategy and suppresses longs below a long-term average.
 
@@ -401,6 +532,7 @@ STRATEGIES: dict[str, Callable[..., Strategy]] = {
     RSIBreakout.name: RSIBreakout,
     MACDTrend.name: MACDTrend,
     BollingerReversion.name: BollingerReversion,
+    Ensemble.name: Ensemble,
 }
 
 
