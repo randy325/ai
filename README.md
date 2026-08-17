@@ -325,6 +325,20 @@ nulls, Coinbase orders its columns `low, high, open, close` and returns rows
 newest-first, Binance's last kline is usually still forming, and Stooq reports
 errors as HTTP 200 with a plain-text body.
 
+### Comparing strategies on real data
+
+`scripts/compare_real.py` fetches once, freezes the bars to a CSV, and runs
+every strategy against that file — including `buy-and-hold` as the benchmark:
+
+```bash
+python scripts/compare_real.py --provider yahoo --symbol AAPL --interval 1d
+python scripts/compare_real.py --provider binance --symbol BTCUSDT --interval 4h
+```
+
+Freezing matters. Fetching per strategy gives each a slightly different window,
+because the newest bar closes while the sweep runs, and a few percent of
+difference then reflects timing rather than the strategy.
+
 **The live providers have not been exercised against the real endpoints.** They
 were built and tested in a sandbox whose egress policy blocks every market-data
 host, so the URL construction and response parsing are verified only against
