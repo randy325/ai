@@ -419,6 +419,7 @@ def main() -> int:
         shape = classify_roughness(jaggedness, count, args.alpha)
 
         values = [v for v, _ in results]
+        low_value, high_value = min(values), max(values)
         stands_alone, margin = is_peaked(values, returns, default)
 
         if spread < 1e-9:
@@ -443,10 +444,11 @@ def main() -> int:
             # point. Any shape read off this is an artefact of the seed count.
             verdict = "UNRESOLVED"
             flags.append(
-                f"{name}: between-point spread {between:.1%} against a within-point "
-                f"standard error of {within:.1%} ({ratio:.1f}x); signal "
+                f"{name}: no effect detected over [{low_value:g}, {high_value:g}] — "
+                f"spread {between:.1%} against a within-point standard error of "
+                f"{within:.1%} ({ratio:.1f}x); signal "
                 f"{describe_signal(between, within, true_between)}; no monotone "
-                f"trend either (p={trend['p']:.2f})"
+                f"trend (p={trend['p']:.2f}). Scoped to that range only"
             )
         elif shape == "jagged":
             verdict = "JAGGED"
@@ -494,6 +496,8 @@ def main() -> int:
     trending = [n for n, tr in trends.items() if tr["p"] < args.alpha]
     print(f"  monotone trends found  : {len(trending)}/{len(trends)}"
           + (f" ({', '.join(trending)})" if trending else ""))
+    print(f"  range swept            : +/-{args.spread:.0%} around each default — "
+          "every null below is scoped to THIS window")
     print(f"  parameters resolved    : {len(resolved)}/{len(verdicts)}")
     print(f"  median across sweep    : {statistics.median(all_returns):+.1%}")
     print(f"  baseline               : {baseline['return']:+.1%}")
@@ -513,6 +517,12 @@ def main() -> int:
         print(f"  positive control puts the smallest detectable effect at {mde:.1%}")
         print("  end-to-end here, so this rules out effects larger than that and")
         print("  says nothing about smaller ones. It is NOT evidence of no effect.")
+        print()
+        print(f"  SCOPE. This null covers +/-{args.spread:.0%} around each default and")
+        print("  nothing outside it. Effects that are flat across a narrow window can")
+        print("  be strong across a wide one: rsi-breakout's lookback shows p=0.94")
+        print("  within +/-30% and a strictly monotone response (p=0.017) over a 16x")
+        print("  range. Widen --spread before concluding a parameter does not matter.")
     elif any(v in {"JAGGED", "PEAKED"} for v in verdicts.values()):
         print("\n  TUNED-LOOKING parameters found. The flagged ones are significantly")
         print("  rougher than noise or sit on isolated peaks; widen or remove them.")

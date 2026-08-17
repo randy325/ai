@@ -388,6 +388,12 @@ percentile, `smooth` below the 5th, and `noise` across the wide middle where
 the statistic cannot tell. `PEAKED` is separate, catching a lone spike that
 roughness misses because only two of its steps are non-zero.
 
+Every null is **scoped to the range swept**. A parameter flat across ±30% can
+be strong across a wider window — `rsi-breakout`'s `lookback` shows p=0.94
+inside ±30% and a strictly monotone response at p=0.017 over a 16× range — so
+the output names the interval each null covers and says to widen `--spread`
+before concluding a parameter does not matter.
+
 **Current result on synthetic data: nothing resolves.** All four strategies
 report UNRESOLVED at 15×25, with a noise-corrected signal of zero. That is the
 correct answer rather than a limitation — a geometric random walk has no
